@@ -233,6 +233,24 @@ check("and the panel still fits the screen",
       lay_stale["x"] >= 0 and lay_stale["x1"] <= W and lay_stale["y1"] <= H,
       f"({lay_stale['x']},{lay_stale['y']})-({lay_stale['x1']},{lay_stale['y1']})")
 
+# ---- 6b. the place line carries the provider's own measurement time
+FIXED = datetime.datetime(2026, 10, 30, 21, 42)
+wx.render(json.loads(json.dumps(live)), CFG, "Zagorje", W, H, True)
+lay_now = dict(wx.LAST_LAYOUT)
+check("place line shows the provider's measurement time (2026-10-30 is a Friday)",
+      "Fri 14:00" in lay_now["place_text"], f"({lay_now['place_text']!r})")
+wx.render(json.loads(json.dumps(stale)), CFG, "Zagorje", W, H, True)
+lay_now2 = dict(wx.LAST_LAYOUT)
+check("a cached panel still names when the reading was measured, not when it was drawn",
+      "Fri 14:00" in lay_now2["place_text"] and "20:37" not in lay_now2["place_text"],
+      f"({lay_now2['place_text']!r})")
+check("a feed with no usable time falls back to the supplied clock",
+      wx.reading_time({"time": None}, FIXED) is FIXED
+      and wx.reading_time({}, FIXED) is FIXED
+      and wx.reading_time({"time": "not a time"}, FIXED) is FIXED
+      and wx.reading_time({"time": "2026-10-30T14:00"}, FIXED)
+          == datetime.datetime(2026, 10, 30, 14, 0))
+
 # ---- 7. text must not be dimmed as hard as the glass it sits on
 def brightest(im, lay, top, height, x0=None, x1=None):
     x0 = lay["x"] if x0 is None else x0

@@ -727,6 +727,17 @@ def soft_alpha(a, bright=240):
     return a if a >= bright else int(a + (bright - a) * 0.5)
 
 
+def reading_time(cur, now):
+    """The moment the provider measured its numbers. ARSO stamps the observation
+    row's own 'valid' time and Open-Meteo the 'current' block's time, both
+    already in the place's local zone; the machine clock is only the fallback
+    for a feed that carries neither."""
+    try:
+        return datetime.strptime(str(cur.get("time"))[:16], "%Y-%m-%dT%H:%M")
+    except (TypeError, ValueError):
+        return now
+
+
 def footer_text(data, now, stale=False):
     """Left footer. Says 'cached' when the numbers are the last good reading and
     'stale' once they are too old to describe right now, so an outdated panel
@@ -846,7 +857,10 @@ def render(data, cfg, label, w, h, dark):
             return 0.0
 
 
-    place_line = f"{label}   {now:%a %H:%M}"
+    # the clock in the place line is the provider's measurement time, not the
+    # moment of rendering, so the panel does not dress up old numbers as fresh
+    reading = reading_time(cur, now)
+    place_line = f"{label}   {reading:%a %H:%M}"
     cond_disp = "" if stale else cond_name
     temp_str = "" if stale else f"{round(cur['temperature_2m'])}{deg}"
     # the slot stays measured on a representative digit so an empty one keeps
@@ -1141,6 +1155,7 @@ def render(data, cfg, label, w, h, dark):
                        row_a_c=y_a + (a_up + a_down) / 2, row_c_c=y_c + (c_up + c_down) / 2,
                        temp_c=mid_y, temp_ink=(y_num + tbb[1], y_num + tbb[3]),
                        stale=stale, temp_text=temp_str, chips=[v for _, v in chips],
+                       place_text=place_line,
                        cell_behind=[c[6] for c in cols])
 
     # drop shadow first, then the whole HUD scaled to the requested visibility

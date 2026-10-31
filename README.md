@@ -10,17 +10,17 @@ by hour, and where the numbers came from. It follows GNOME's light/dark setting
 and the screen you actually have.
 
     ┌──────────────────────────────────────────────────────────────────────┐
-    │  @ Zagorje ob Savi   Fri 22:38                        Mostly clear   │
+    │  @ Zagorje ob Savi   Fri 22:00                        Mostly clear   │
     │ ┃                                                                    │
     │ ┃     8°            [icon]                        [>] 11 km/h SE     │
     │ ┃                                                                    │
     │ ┃     RH 86%   Feels 6°   Hi 13°   Lo 4°   Rain 0.2mm                │
     │ ┃                                                                    │
-    │ ┃     23   00   01   02   03   04   05   06   07   08   09   10      │
-    │ ┃     cl   ra   ra   cl   su   su   cl   ov   ov   ov   cl   cl      │
-    │ ┃     6°   6°   5°   5°   4°   4°   4°   5°   5°   6°   6°   7°      │
-    │ ┃     _    ##    ###  _    _    _    _    #    #    _    _    _      │
-    │ ┃     0mm  1mm   2mm  0mm  0mm  0mm  0mm  1mm  1mm  0mm  0mm  0mm    │
+    │ ┃     22   23   00   01   02   03   04   05   06   07   08   09      │
+    │ ┃     cl   cl   ra   ra   cl   su   su   cl   ov   ov   ov   cl      │
+    │ ┃     6°   6°   6°   5°   5°   4°   4°   4°   5°   5°   6°   6°      │
+    │ ┃     _    _    ##   ###  _    _    _    _    #    #    _    _       │
+    │ ┃     0mm  0mm  1mm  2mm  0mm  0mm  0mm  0mm  1mm  1mm  0mm  0mm     │
     │ ┃                                                                    │
     │ ┃     updated 22:38 · ARSO            sunrise 06:38   sunset 16:49   │
     └──────────────────────────────────────────────────────────────────────┘
@@ -143,7 +143,10 @@ died on a hostname lookup specifically — that signature means the Wi-Fi
 association is still in progress, so the script waits for it rather than
 burning its retries on a network that does not exist yet. A cached reading's
 footer then says `updated 23:30 · cached · ARSO` — the time of the last
-successful fetch, not the current clock.
+successful fetch, not the current clock. The clock in the top line is different:
+both providers stamp their own measurement time on the reading (ARSO's
+observation `valid` time, Open-Meteo's `current.time`), and that is what the
+panel shows, falling back to the machine clock only if a feed carries neither.
 
 **Once that cached reading is older than `stale_after_min` (an hour), it stops
 being presented as current.** The big temperature, the condition name and icon,
@@ -234,7 +237,7 @@ size; every spacing below is multiplied by it.
 
        x0 ─────────────────────────────────────────────────────────── x1
        │                                                          rx  │
-       │  cx      place_line (@ + "Place  Fri 22:38")     cond_name   │  row A
+       │  cx      place_line (@ + "Place  Fri 22:00")     cond_name   │  row A
        │                                                              │  │   f.small / f.cond
        │                                       gap_a = 20s            │  │   height 44s
        │  ┃                                                           │  │
@@ -243,7 +246,7 @@ size; every spacing below is multiplied by it.
        │  ┃                                       gap_b = 24s         │  │
        │  ┃   chip: RH 86% | Feels 6° | Hi 13° | Lo 4° | Rain 0.2mm   │  row C
        │  ┃                                       gap_c = 20s         │  │   height 40s
-       │  ┃   23   00   01 ... 12 hourly cells ...                    │  row D1  hour_h  21s
+       │  ┃   22   23   00 ... 12 hourly cells ...                    │  row D1  hour_h  21s
        │  ┃   cl   ra   su ...                                        │          icon_h  28s
        │  ┃   6°   6°   5° ...                                        │          temp_h  31s
        │  ┃   _    ##   _  ...  rain bar (precip_frac)                │          rain_h  + bar_h
