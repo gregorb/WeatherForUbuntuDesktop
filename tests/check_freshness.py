@@ -139,7 +139,10 @@ finally:
     wx.log = real_log
     wx.fetch_arso, wx.fetch_open_meteo = real_arso, real_om
 
-# ---- 2. the unlock decision (watch_unlock reads gdbus monitor lines like these)
+# ---- 2. the unlock decision (watch_unlock feeds each gdbus monitor line
+#      joined with the one before it: current gdbus prints the whole signal
+#      on one line, '...ActiveChanged (false,)', older builds split the
+#      boolean onto the line after the member=ActiveChanged header)
 UNLOCK = ("signal sender=:1.63 -> dest=(null destination) serial=245 "
           "path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; "
           "member=ActiveChanged\n   boolean false")
@@ -150,6 +153,32 @@ NOISE = ("signal sender=:1.63 -> dest=(null destination) serial=246 "
 check("an unlock line is recognised", wx.unlock_seen(UNLOCK))
 check("a lock is not", not wx.unlock_seen(LOCK))
 check("other ScreenSaver traffic is not", not wx.unlock_seen(NOISE))
+NEW_UNLOCK = ("/org/gnome/ScreenSaver: org.gnome.ScreenSaver.ActiveChanged (false,)\n")
+NEW_LOCK = ("/org/gnome/ScreenSaver: org.gnome.ScreenSaver.ActiveChanged (true,)\n")
+NEW_NOISE = ("/org/gnome/ScreenSaver: org.freedesktop.DBus.Properties."
+             "PropertiesChanged ('org.gnome.ScreenSaver', {'Active': <false>}, [])\n")
+check("the one-line gdbus format is recognised", wx.unlock_seen(NEW_UNLOCK))
+check("...its lock is not", not wx.unlock_seen(NEW_LOCK))
+check("...its PropertiesChanged noise is not", not wx.unlock_seen(NEW_NOISE))
+
+
+def unlocks(lines):
+    """How many unlocks watch_unlock sees in a stream of monitor lines."""
+    hits, prev = 0, ""
+    for line in lines:
+        if wx.unlock_seen(prev + line):
+            hits, prev = hits + 1, ""
+        else:
+            prev = line if "ActiveChanged" in line else ""
+    return hits
+
+
+check("a legacy signal split over two lines is still one unlock",
+      unlocks(UNLOCK.split("\n", 1)) == 1)
+check("a legacy lock right after an unlock is not mistaken for another unlock",
+      unlocks([UNLOCK.split("\n", 1)[1], *LOCK.split("\n", 1)]) == 0)
+check("a session's worth of both formats yields exactly its two unlocks",
+      unlocks([NEW_LOCK, NEW_NOISE, *UNLOCK.split("\n", 1), NEW_UNLOCK]) == 2)
 
 base = {"refresh_on_unlock": True, "unlock_min_gap": 300}
 check("unlocked with no cached reading at all: refresh", wx.unlock_refresh_due(UNLOCK, base, None))
@@ -160,6 +189,9 @@ check("refresh_on_unlock=false is honoured",
       not wx.unlock_refresh_due(UNLOCK, {"refresh_on_unlock": False}, None))
 check("unlock_min_gap=0 refreshes on every unlock",
       bool(wx.unlock_refresh_due(UNLOCK, {"unlock_min_gap": 0}, 1)))
+check("the one-line unlock format carries the same decision",
+      wx.unlock_refresh_due(NEW_UNLOCK, base, 600)
+      and not wx.unlock_refresh_due(NEW_LOCK, base, None))
 
 # ---- 3. what a panel older than stale_after_min may still show
 now = datetime.datetime.now()

@@ -1163,10 +1163,22 @@ def render(data, cfg, label, w, h, dark):
 
 # -------------------------------------------------------------------- main
 
-def unlock_seen(line):
-    """True on the gdbus monitor line announcing that the screen was just
-    unlocked; a lock is the same signal carrying true instead of false."""
-    return "ActiveChanged" in line and "boolean false" in line
+def unlock_seen(lines):
+    """True when this gdbus monitor text announces that the screen was just
+    unlocked; a lock is the same signal carrying true instead of false.
+
+    Current gdbus prints the whole signal on one line, '... ActiveChanged
+    (false,)'; older builds named the member on the signal line and printed
+    the 'boolean false' argument on the line that followed, so watch_unlock
+    passes each line joined with the one before it. Only text after the
+    signal name counts, so a lock's header followed by an unrelated false
+    on the next line cannot read as an unlock.
+    """
+    at = lines.find("ActiveChanged")
+    if at < 0:
+        return False
+    rest = lines[at:]
+    return "boolean false" in rest or "(false" in rest
 
 
 def unlock_refresh_due(line, cfg, cache_age_s):
@@ -1204,10 +1216,13 @@ def watch_unlock(cfg):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     log("watching for desktop unlocks")
+    prev = ""  # older gdbus split one signal over a header line and an argument line
     try:
         for line in proc.stdout or []:
-            if not unlock_seen(line):
+            if not unlock_seen(prev + line):
+                prev = line if "ActiveChanged" in line else ""
                 continue
+            prev = ""
             live = load_config()
             age = (time.time() - CACHE_FILE.stat().st_mtime) if CACHE_FILE.exists() else None
             if not unlock_refresh_due(line, live, age):
