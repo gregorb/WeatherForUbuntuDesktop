@@ -16,13 +16,13 @@ and the screen you actually have.
     │ ┃                                                                    │
     │ ┃     RH 86%   Feels 6°   Hi 13°   Lo 4°   Rain 0.2mm                │
     │ ┃                                                                    │
-    │ ┃     23   00   01   02   03   04   05   06   07   08   09   10       │
-    │ ┃     cl   ra   ra   cl   su   su   cl   ov   ov   ov   cl   cl       │
-    │ ┃     6°   6°   5°   5°   4°   4°   4°   5°   5°   6°   6°   7°       │
-    │ ┃     _    ##    ###  _    _    _    _    #    #    _    _    _       │
-    │ ┃     0mm  1mm   2mm  0mm  0mm  0mm  0mm  1mm  1mm  0mm  0mm  0mm     │
+    │ ┃     23   00   01   02   03   04   05   06   07   08   09   10      │
+    │ ┃     cl   ra   ra   cl   su   su   cl   ov   ov   ov   cl   cl      │
+    │ ┃     6°   6°   5°   5°   4°   4°   4°   5°   5°   6°   6°   7°      │
+    │ ┃     _    ##    ###  _    _    _    _    #    #    _    _    _      │
+    │ ┃     0mm  1mm   2mm  0mm  0mm  0mm  0mm  1mm  1mm  0mm  0mm  0mm    │
     │ ┃                                                                    │
-    │ ┃     updated 22:38 · ARSO            sunrise 06:38   sunset 16:49    │
+    │ ┃     updated 22:38 · ARSO            sunrise 06:38   sunset 16:49   │
     └──────────────────────────────────────────────────────────────────────┘
       ^ hairline outline, rounded corners, soft drop shadow under the panel
       ┃ vertical accent bar, tinted by the current condition (or night blue)
@@ -210,15 +210,16 @@ developing so edits here take effect on the next refresh.
         │      ├─ fetch_arso()       vreme.si API ── translate ─┐
         │      │                       (fails → try next)       │
         │      └─ fetch_open_meteo()                            ├─ one common shape
-        │                                                     ┘
+        │                                                       ┘
         │      all failed → read last-weather.json; footer gains "· cached",
         │        or "· stale" plus dropped "now" values when older than stale_after_min
         ▼
     render(data, cfg, label, w, h, dark)
         │      base wallpaper ─ tint ─ shadow ─ glass layer (hud_opacity)
-        │                                   └ text layer (hud_text_opacity)
+        │                                   └─ text layer (hud_text_opacity)
         ▼
     apply_wallpaper(path) ── gsettings picture-uri + picture-uri-dark ── GNOME reloads
+        │
         ▼
     prune() keeps the newest `keep_files` renders
 
@@ -231,26 +232,26 @@ Rows are laid out top to bottom from a measured text pass, so the panel can
 never be too small for its own content. `s` is `panel_scale` adjusted for screen
 size; every spacing below is multiplied by it.
 
-      x0 ──────────────────────────────────────────────────────────── x1
-       │                                                          rx │
-       │  cx      place_line (@ + "Place  Fri 22:38")     cond_name │   row A
-       │                                                          │ │   f.small / f.cond
-       │                                       gap_a = 20s          │ │   height 44s
-       │  ┃                                                         │ │
-       │  ┃   temp_str (f.big, ink-centred)  icon  arrow  wind_txt  │   row B
-       │  ┃                                     icon_xl       f.body │   height th
-       │  ┃                                       gap_b = 24s        │ │
-       │  ┃   chip: RH 86% | Feels 6° | Hi 13° | Lo 4° | Rain 0.2mm  │   row C
-       │  ┃                                       gap_c = 20s        │ │   height 40s
-       │  ┃   23   00   01 ... 12 hourly cells ...                   │   row D1  hour_h  21s
-       │  ┃   cl   ra   su ...                                       │         icon_h  28s
-       │  ┃   6°   6°   5° ...                                       │         temp_h  31s
-       │  ┃   _    ##   _  ...  rain bar (precip_frac)               │         rain_h  + bar_h
-       │  ┃   0mm  1mm  0mm ...                                      │
-       │  ┃                                       foot_h             │
-       │  ┃   updated 22:38 · ARSO          sunrise 06:38 sunset 16:49│   footer
-       │                                                          │ │
-       x0 ──────────────────────────────────────────────────────────── x1
+       x0 ─────────────────────────────────────────────────────────── x1
+       │                                                          rx  │
+       │  cx      place_line (@ + "Place  Fri 22:38")     cond_name   │  row A
+       │                                                              │  │   f.small / f.cond
+       │                                       gap_a = 20s            │  │   height 44s
+       │  ┃                                                           │  │
+       │  ┃   temp_str (f.big, ink-centred)  icon  arrow  wind_txt    │  row B
+       │  ┃                                     icon_xl       f.body  │  height th
+       │  ┃                                       gap_b = 24s         │  │
+       │  ┃   chip: RH 86% | Feels 6° | Hi 13° | Lo 4° | Rain 0.2mm   │  row C
+       │  ┃                                       gap_c = 20s         │  │   height 40s
+       │  ┃   23   00   01 ... 12 hourly cells ...                    │  row D1  hour_h  21s
+       │  ┃   cl   ra   su ...                                        │          icon_h  28s
+       │  ┃   6°   6°   5° ...                                        │          temp_h  31s
+       │  ┃   _    ##   _  ...  rain bar (precip_frac)                │          rain_h  + bar_h
+       │  ┃   0mm  1mm  0mm ...                                       │
+       │  ┃                                       foot_h              │
+       │  ┃   updated 22:38 · ARSO         sunrise 06:38 sunset 16:49 │  footer
+       │                                                              │  │
+       x0 ─────────────────────────────────────────────────────────── x1
        └─ accent bar: rounded rectangle from y0+28s to y1-28s, 5s wide,
           tinted by the WMO condition colour, night blue after sunset
 
