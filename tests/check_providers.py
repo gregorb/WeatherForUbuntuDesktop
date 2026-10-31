@@ -75,8 +75,12 @@ check("wind converted m/s -> km/h",
 check("UTC observation time shifted to local",
       cur["time"][11:16] != row["valid"][11:16] or row["valid"].endswith("+01:00"),
       f"(raw {row['valid']} -> local {cur['time']})")
-check("night recognised after sunset",
-      cur["is_day"] == 0, f"(sunset {day['sunset']}, local time {cur['time']})")
+_dawn, _dusk = int(day["sunrise"][11:13]), int(day["sunset"][11:13])
+_want_day = 1 if _dawn <= int(cur["time"][11:13]) < _dusk else 0
+check("day/night recognised against the local clock",
+      cur["is_day"] == _want_day,
+      f"(local {cur['time'][11:16]}, dawn {_dawn:02d}, dusk {_dusk:02d}, "
+      f"is_day={cur['is_day']})")
 check("sunrise/sunset passed in the shape the renderer reads",
       metric["daily"]["sunrise"][0][11:16] == day["sunrise"][11:16]
       and metric["daily"]["sunset"][0][11:16] == day["sunset"][11:16],

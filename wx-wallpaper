@@ -17,6 +17,8 @@ import json
 import math
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import unicodedata
@@ -69,6 +71,15 @@ DEFAULTS = {
                                  # the hourly strip spreads to fill the extra room
     "keep_files": 5,
     "timeout": 15,
+    # Right after login DNS and Wi-Fi are often still settling; retry the whole
+    # provider chain instead of painting hours-old cache on the first failure.
+    "fetch_retries": 2,
+    "fetch_retry_wait": 15,        # seconds, doubled between attempts
+    # Once a cached reading is this old, the "right now" numbers are dropped
+    # and hourly cells that have slipped behind the clock go empty.
+    "stale_after_min": 60,
+    "refresh_on_unlock": True,     # used by wx-wallpaper --watch-unlock
+    "unlock_min_gap": 300,         # seconds between unlock-triggered refreshes
 }
 
 FA = "/usr/share/fonts/opentype/font-awesome/FontAwesome.otf"
@@ -538,6 +549,27 @@ def fetch_weather(lat, lon, cfg, place):
     raise RuntimeError("no weather provider answered (" + "; ".join(errors) + ")")
 
 
+def fetch_weather_retry(lat, lon, cfg, place):
+    """fetch_weather, with a couple of attempts.
+
+    The run that happens right after login regularly wins the race against DNS
+    and loses: one failed attempt used to mean a wallpaper showing last night's
+    weather for the next quarter of an hour. So retry with a growing pause.
+    """
+    tries = max(1, int(cfg.get("fetch_retries", 2)) + 1)
+    base = max(0, int(cfg.get("fetch_retry_wait", 15)))
+    for attempt in range(1, tries + 1):
+        try:
+            return fetch_weather(lat, lon, cfg, place)
+        except Exception:
+            if attempt >= tries:
+                raise
+            nap = base * (2 ** (attempt - 1))
+            log(f"no provider answered (attempt {attempt}/{tries}); retrying in {nap}s")
+            if nap:
+                time.sleep(nap)
+
+
 # --------------------------------------------------------------- gsettings
 
 def sh(cmd, **kw):
@@ -638,12 +670,13 @@ def soft_alpha(a, bright=240):
     return a if a >= bright else int(a + (bright - a) * 0.5)
 
 
-def footer_text(data, now):
-    """Left footer. Says 'cached' when the numbers are the last good reading, so
-    a stale panel cannot be mistaken for a freshly fetched one."""
+def footer_text(data, now, stale=False):
+    """Left footer. Says 'cached' when the numbers are the last good reading and
+    'stale' once they are too old to describe right now, so an outdated panel
+    cannot be mistaken for a freshly fetched one."""
     cached_at = data.get("_cached")
     provider = str(data.get("provider") or "")
-    text = (f"updated {cached_at} · cached" if cached_at
+    text = (f"updated {cached_at} · {'stale' if stale else 'cached'}" if cached_at
             else f"updated {now:%H:%M}")
     return text + (f"  ·  {provider}" if provider else "")
 
@@ -733,6 +766,10 @@ def render(data, cfg, label, w, h, dark):
     deg = "°F" if imperial else "°"
     wunit = "mph" if imperial else "km/h"
     now = datetime.now().astimezone()
+    # A cached reading older than the limit cannot describe right now. The big
+    # number, the condition, the wind and the instant chips are dropped rather
+    # than shown wrongly; daily highs/lows age slowly enough to keep.
+    stale = int(data.get("_age_min") or 0) > int(cfg.get("stale_after_min", 60))
 
     # ---------------------------------------------------------------- content
     hh = data.get("hourly", {})
@@ -753,19 +790,27 @@ def render(data, cfg, label, w, h, dark):
 
 
     place_line = f"{label}   {now:%a %H:%M}"
-    temp_str = f"{round(cur['temperature_2m'])}{deg}"
-    wind_txt = (f"{round(cur['wind_speed_10m'])} {wunit} "
+    cond_disp = "" if stale else cond_name
+    temp_str = "" if stale else f"{round(cur['temperature_2m'])}{deg}"
+    # the slot stays measured on a representative digit so an empty one keeps
+    # exactly the space a filled one had; only the glyphs are withheld
+    temp_m = temp_str or f"0{deg}"
+    wind_txt = ("" if stale else
+                f"{round(cur['wind_speed_10m'])} {wunit} "
                 f"{COMPASS[int((cur['wind_direction_10m'] + 11.25) // 22.5) % 16]}")
-    chips = [("drop", f"{round(cur['relative_humidity_2m'])}%")]
-    feels = cur.get("apparent_temperature")
-    if feels is not None:
-        chips.append(("therm", f"{round(float(feels))}{deg}"))
-    try:
+    chips = []
+    if not stale:                      # instant readings: meaningless once stale
+        chips.append(("drop", f"{round(cur['relative_humidity_2m'])}%"))
+        feels = cur.get("apparent_temperature")
+        if feels is not None:
+            chips.append(("therm", f"{round(float(feels))}{deg}"))
+    try:                               # daily extremes age slowly enough to keep
         chips.append(("sunrise", f"{round(daily['temperature_2m_max'][0])}{deg}"))
         chips.append(("sunset", f"{round(daily['temperature_2m_min'][0])}{deg}"))
     except (KeyError, IndexError, TypeError):
         pass
-    chips.append(("umbrella", precip_text(precip_at(idx), pkind)))
+    if not stale:
+        chips.append(("umbrella", precip_text(precip_at(idx), pkind)))
 
     temps, hours = [], []
     hp = hh.get("temperature_2m") or []
@@ -799,10 +844,19 @@ def render(data, cfg, label, w, h, dark):
         if ik == "sun" and not dawn <= hour < dusk:
             ik = "moon"
         pval = precip_at(i)
+        stamp = ht[i] if i < len(ht) else ""
+        try:
+            behind = (now.replace(tzinfo=None) - datetime.strptime(stamp, "%Y-%m-%dT%H:%M")
+                      > timedelta(minutes=int(cfg.get("stale_after_min", 60))))
+        except (TypeError, ValueError):
+            behind = False
+        # live feeds start at the current hour, so only a stale reading can
+        # carry cells the clock has left behind
         cols.append((ht[i][11:16] if i < len(ht) else f"{hour:02d}", ik,
-                     f"{round(value)}{deg}", precip_text(pval, pkind), pval, pkind))
+                     f"{round(value)}{deg}", precip_text(pval, pkind), pval, pkind,
+                     bool(behind and stale)))
 
-    foot_l = footer_text(data, now)
+    foot_l = footer_text(data, now, stale)
     foot_r = ""
     try:
         foot_r = (f"sunrise {daily['sunrise'][0][11:16]}   "
@@ -843,11 +897,11 @@ def render(data, cfg, label, w, h, dark):
         strip_w = cell_w * len(cols)          # narrowest the strip can be; it may
                                               # later be spread across a wider panel
 
-        tw = probe.textlength(temp_str, font=f.big)
-        th = f.big.getbbox(temp_str)[3] - f.big.getbbox(temp_str)[1]
-        iw = f.icon_xl.getbbox(ICON[icon_key])[2]
-        cw = probe.textlength(cond_name, font=f.cond)
-        ww = probe.textlength(wind_txt, font=f.body) + int(40 * s)
+        tw = probe.textlength(temp_m, font=f.big)
+        th = f.big.getbbox(temp_m)[3] - f.big.getbbox(temp_m)[1]
+        iw = 0 if stale else f.icon_xl.getbbox(ICON[icon_key])[2]
+        cw = probe.textlength(cond_disp, font=f.cond)
+        ww = 0 if stale else probe.textlength(wind_txt, font=f.body) + int(40 * s)
         pl = probe.textlength(place_line, font=f.small) + int(28 * s)
         fl = probe.textlength(foot_l, font=f.tiny)
         fr = probe.textlength(foot_r, font=f.tiny)
@@ -857,7 +911,7 @@ def render(data, cfg, label, w, h, dark):
             chip_w += int(28 * s) + probe.textlength(value, font=f.label) + int(34 * s)
         chip_w = max(0, chip_w - int(34 * s))
 
-        row_left = tw + int(26 * s) + iw + int(34 * s) + max(cw, ww)
+        row_left = tw if stale else tw + int(26 * s) + iw + int(34 * s) + max(cw, ww)
         row_a = pl + int(50 * s) + cw            # place line + condition
         use_strip = bool(cols) and hourly == "strip"
         rows_h = strip_h if use_strip else spark_h + tick_h
@@ -929,7 +983,7 @@ def render(data, cfg, label, w, h, dark):
            fill=fg2 + (190,))
     td.text((cx + int(24 * s) + int(22 * s), y), place_line, font=f.small,
            fill=fg2 + (240,))
-    td.text((rx, y + int(1 * s)), cond_name, font=f.cond, fill=fg + (255,), anchor="ra")
+    td.text((rx, y + int(1 * s)), cond_disp, font=f.cond, fill=fg + (255,), anchor="ra")
     y_a = y                                        # top of the location line
     y += int(44 * s) + lay["gap_a"]
 
@@ -942,18 +996,21 @@ def render(data, cfg, label, w, h, dark):
     a_up, a_down = f.small.getmetrics()
     c_up, c_down = f.label.getmetrics()
     mid_y = ((y_a + (a_up + a_down) / 2) + (y_c + (c_up + c_down) / 2)) / 2
-    tbb = f.big.getbbox(temp_str)
+    tbb = f.big.getbbox(temp_m)
     y_num = mid_y - (tbb[1] + tbb[3]) / 2
-    td.text((cx - int(4 * s), y_num), temp_str, font=f.big, fill=fg + (255,))
-    ix = cx + lay["tw"] + int(26 * s)
-    ibb = f.icon_xl.getbbox(ICON[icon_key])
-    td.text((ix, mid_y - (ibb[1] + ibb[3]) / 2), ICON[icon_key],
-            font=f.icon_xl, fill=accent + (235,))
-    arrow = dir_arrow(int(32 * s), float(cur["wind_direction_10m"]) + 180, fg2 + (215,))
-    ax = rx - lay["ww"] + int(6 * s)
-    hud.alpha_composite(arrow, (int(ax), int(y + lay["th"] - int(34 * s))))
-    td.text((rx, y + lay["th"] - int(30 * s)), wind_txt, font=f.body,
-           fill=fg2 + (245,), anchor="ra")
+    if temp_str:      # a stale reading leaves the number slot empty, in place
+        td.text((cx - int(4 * s), y_num), temp_str, font=f.big, fill=fg + (255,))
+    if not stale:      # the current condition and wind are precisely what a
+        ix = cx + lay["tw"] + int(26 * s)
+        ibb = f.icon_xl.getbbox(ICON[icon_key])          # stale reading can no
+        td.text((ix, mid_y - (ibb[1] + ibb[3]) / 2), ICON[icon_key],        # longer
+                font=f.icon_xl, fill=accent + (235,))                       # state
+        arrow = dir_arrow(int(32 * s), float(cur["wind_direction_10m"]) + 180,
+                          fg2 + (215,))
+        ax = rx - lay["ww"] + int(6 * s)
+        hud.alpha_composite(arrow, (int(ax), int(y + lay["th"] - int(34 * s))))
+        td.text((rx, y + lay["th"] - int(30 * s)), wind_txt, font=f.body,
+               fill=fg2 + (245,), anchor="ra")
     y += lay["th"] + lay["gap_b"]
 
     # row C: chips
@@ -974,10 +1031,12 @@ def render(data, cfg, label, w, h, dark):
         y_bar = y_rain + lay["rain_h"]
         LAST_LAYOUT.update(strip_y=y, strip_h=lay["strip_h"], cell_w=cell,
                            hours=len(cols), strip_x=cx)
-        for i, (hlabel, hicon, htemp, ptext, pval, pkind) in enumerate(cols):
+        for i, (hlabel, hicon, htemp, ptext, pval, pkind, behind) in enumerate(cols):
             mid = cx + cell * i + cell / 2
             td.text((mid, y), hlabel, font=f.tiny, fill=fg2 + (soft_alpha(215),),
                    anchor="ma")
+            if behind:      # this hour has come and gone while the data stood still
+                continue
             td.text((mid, y_icon), ICON[hicon], font=f.icon_s, fill=accent + (230,),
                    anchor="ma")
             td.text((mid, y_temp), htemp, font=f.label, fill=fg + (245,), anchor="ma")
@@ -1003,7 +1062,9 @@ def render(data, cfg, label, w, h, dark):
 
     LAST_LAYOUT.update(opacity=opacity, text_opacity=text_opacity,
                        row_a_c=y_a + (a_up + a_down) / 2, row_c_c=y_c + (c_up + c_down) / 2,
-                       temp_c=mid_y, temp_ink=(y_num + tbb[1], y_num + tbb[3]))
+                       temp_c=mid_y, temp_ink=(y_num + tbb[1], y_num + tbb[3]),
+                       stale=stale, temp_text=temp_str, chips=[v for _, v in chips],
+                       cell_behind=[c[6] for c in cols])
 
     # drop shadow first, then the whole HUD scaled to the requested visibility
     shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -1025,6 +1086,65 @@ def render(data, cfg, label, w, h, dark):
 
 # -------------------------------------------------------------------- main
 
+def unlock_seen(line):
+    """True on the gdbus monitor line announcing that the screen was just
+    unlocked; a lock is the same signal carrying true instead of false."""
+    return "ActiveChanged" in line and "boolean false" in line
+
+
+def unlock_refresh_due(line, cfg, cache_age_s):
+    """Whether this line should trigger a refresh: an unlock, the feature
+    switched on, and the cached reading old enough that the unlock is not just
+    re-rendering what the timer drew a moment ago."""
+    if not unlock_seen(line):
+        return False
+    if not cfg.get("refresh_on_unlock", True):
+        return False
+    gap = max(0, int(cfg.get("unlock_min_gap", 300)))
+    return cache_age_s is None or cache_age_s >= gap
+
+
+def watch_unlock(cfg):
+    """Refresh whenever the desktop is unlocked, until systemd stops us.
+
+    GNOME publishes ActiveChanged on org.gnome.ScreenSaver; ActiveChanged(false)
+    means the screen was just unlocked. gdbus comes with the same package as
+    gsettings, so this adds no new dependency. Settings are re-read on every
+    event, so toggling them needs no restart.
+    """
+    if not shutil.which("gdbus"):
+        log("gdbus not found; cannot watch for unlocks")
+        return 1
+    proc = subprocess.Popen(
+        ["gdbus", "monitor", "--session", "--dest", "org.gnome.ScreenSaver",
+         "--object-path", "/org/gnome/ScreenSaver"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+    def stop(_signum, _frame):
+        proc.terminate()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    log("watching for desktop unlocks")
+    try:
+        for line in proc.stdout or []:
+            if not unlock_seen(line):
+                continue
+            live = load_config()
+            age = (time.time() - CACHE_FILE.stat().st_mtime) if CACHE_FILE.exists() else None
+            if not unlock_refresh_due(line, live, age):
+                log("unlocked, but the reading is still fresh")
+                continue
+            log("desktop unlocked; refreshing")
+            subprocess.run([sys.executable, os.path.abspath(__file__)])
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        proc.terminate()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dry-run", action="store_true",
@@ -1032,9 +1152,14 @@ def main():
     ap.add_argument("--output", help="write the image here instead of the wallpaper dir")
     ap.add_argument("--place", help="city name to look up, e.g. 'Maribor,SI'")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--watch-unlock", action="store_true",
+                    help="keep running and refresh whenever the desktop is unlocked")
     args = ap.parse_args()
 
     cfg = load_config()
+    if args.watch_unlock:
+        return watch_unlock(cfg)
+
     if args.place:
         cfg["place"] = args.place
         cfg["latitude"] = cfg["longitude"] = None
@@ -1067,7 +1192,7 @@ def main():
     before = json.dumps(cfg, sort_keys=True)
     try:
         lat, lon, label, source = resolve_place(cfg)
-        data = fetch_weather(lat, lon, cfg, label)
+        data = fetch_weather_retry(lat, lon, cfg, label)
         CACHE_FILE.write_text(json.dumps(data))
     except Exception as exc:
         log(f"fetch failed: {exc}")
@@ -1078,8 +1203,9 @@ def main():
             if isinstance(label, str) and label == "auto":
                 label = "Home"
             source = "cached reading"
-            data["_cached"] = datetime.fromtimestamp(
-                CACHE_FILE.stat().st_mtime).astimezone().strftime("%H:%M")
+            stamp = CACHE_FILE.stat().st_mtime
+            data["_cached"] = datetime.fromtimestamp(stamp).astimezone().strftime("%H:%M")
+            data["_age_min"] = int((time.time() - stamp) / 60)
             log("using last good weather instead")
         else:
             log("no cached weather either; leaving the desktop alone")

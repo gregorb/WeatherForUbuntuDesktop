@@ -45,16 +45,17 @@ No API keys, no accounts, no root.
     cd ~/WeatherForUbuntuDesktop
     ./install.sh
 
-That copies `wx-wallpaper` to `~/.local/bin`, copies the two systemd user units
-to `~/.config/systemd/user`, enables the timer, and renders once so you see
-something immediately. Your desktop wallpaper is kept as the image the panel is
+That copies `wx-wallpaper` to `~/.local/bin`, copies the three systemd user
+units to `~/.config/systemd/user`, enables the refresh timer and the unlock
+watcher, and renders once so you see something immediately. Your desktop wallpaper is kept as the image the panel is
 drawn onto, so the desktop still looks like your desktop.
 
 Verify:
 
     wx-wallpaper --status                       # config, Wi-Fi, cache, current URI
-    journalctl --user -u wx-wallpaper -f        # watch a refresh happen
+    journalctl --user -u wx-wallpaper -u wx-wallpaper-unlock -f        # watch a refresh happen
     systemctl --user list-timers wx-wallpaper.timer
+    systemctl --user status wx-wallpaper-unlock.service   # "watching for desktop unlocks"
 
 Try a change without touching the desktop:
 
@@ -85,6 +86,9 @@ force one with `systemctl --user start wx-wallpaper.service`.
 | `resolution`   | `null` = read from Mutter; or force e.g. `"2560x1440"` |
 | `keep_files`   | how many renders to retain in `~/.local/share/wx-wallpaper` |
 | `timeout`      | per-request HTTP timeout in seconds |
+| `fetch_retries` / `fetch_retry_wait` | if every provider fails, retry the whole chain this many times, waiting this many seconds first and doubling each time — the point is the first minute after login, when DNS is often not up yet |
+| `stale_after_min` | once a cached reading is older than this it stops pretending: the current temperature, condition, wind and instant chips disappear (their slots stay, empty, same size), hourly cells the clock passed more than this long ago keep only their hour label, and the footer reads `stale` instead of `cached` |
+| `refresh_on_unlock` / `unlock_min_gap` | used by `wx-wallpaper-unlock.service`: refresh on desktop unlock, but not if the cache is only `unlock_min_gap` seconds old — the timer just drew this same panel |
 
 Two handy commands:
 
@@ -114,15 +118,35 @@ Slovenia simply falls through to Open-Meteo.
 
 ### Refresh schedule
 
-`~/.config/systemd/user/wx-wallpaper.timer` fires at every quarter hour
-(`OnCalendar=*:0/15`), 40 seconds after you log in, and `Persistent=true` makes a
-missed run catch up when the machine wakes. To change it, edit the installed
-timer and run `systemctl --user daemon-reload`.
+Three units keep the panel current:
 
-If the network is down the last good reading is reused, and its footer then says
-`updated 20:37 · cached · ARSO` — the time of the last successful fetch, not the
-current clock. With no reading at all the desktop is left alone rather than
-blanked.
+* `wx-wallpaper.timer` fires at every quarter hour (`OnCalendar=*:0/15`), 40
+  seconds after you log in, and `Persistent=true` makes a missed run catch up
+  when the machine wakes.
+* `wx-wallpaper.service` is the one-shot render the timer runs (`systemctl
+  --user start wx-wallpaper.service` forces one right now).
+* `wx-wallpaper-unlock.service` stays resident for the whole session and
+  refreshes the moment you unlock the desktop — it watches `ActiveChanged(false)`
+  on `org.gnome.ScreenSaver` via `gdbus`, so no new dependency. Unlocking is the
+  first thing you do after logging in, and the timer's 40-second delay may not
+  have fired (or may have raced the network, see below).
+
+To change the schedule, edit the installed unit and run `systemctl --user daemon-reload`.
+
+**If the network is down** — which is routine in the first minute after login,
+before DNS catches up — the whole provider chain is retried (`fetch_retries`
+attempts with doubling waits) before falling back to the last good reading. That
+reading's footer then says `updated 23:30 · cached · ARSO` — the time of the last
+successful fetch, not the current clock.
+
+**Once that cached reading is older than `stale_after_min` (an hour), it stops
+being presented as current.** The big temperature, the condition name and icon,
+the wind, and the humidity/feels-like/current-rain chips are all withheld — the
+slots stay exactly the same size and simply show nothing. Hourly cells the clock
+has left behind keep only their hour label, and the footer says `stale`. What
+remains — today's high/low, sunrise/sunset, and the hours still ahead — is what
+the reading can still honestly state. With no reading at all the desktop is left
+alone rather than blanked.
 
 ## Uninstall
 
@@ -133,7 +157,7 @@ blanked.
 
 * **Nothing changed on screen.** GNOME reloads the wallpaper only when the *path*
   changes; every render is a new file, so check `wx-wallpaper --status` for the
-  URI and `journalctl --user -u wx-wallpaper` for errors.
+  URI and `journalctl --user -u wx-wallpaper -u wx-wallpaper-unlock` for errors.
 * **The panel is off-screen or the wrong size.** Check `resolution` (null is
   usually right) and the `margin_*_frac` values; the panel never grows past the
   screen, but a huge `panel_scale` with a big `margin` can push it around.
@@ -143,6 +167,10 @@ blanked.
 * **Wrong town.** `wx-wallpaper --status` shows the SSID it sees and what that SSID
   maps to; `--place Someplace` pins a place explicitly.
 * **Weather looks stale.** `--status` prints `cache_age_s` and `last_provider`.
+  A panel with an empty temperature slot and a `stale` footer means every fetch
+  failed and even the cache is past `stale_after_min`; the reason is in
+  `journalctl --user -u wx-wallpaper -u wx-wallpaper-unlock` (usually `Name or service not known` at
+  login, which the retries then overcome).
 
 ---
 
@@ -154,8 +182,8 @@ blanked.
     install.sh                copy/symlink the script, install units, start the timer
     uninstall.sh              the reverse, with --purge
     config.example.json       what install.sh copies to ~/.config/wx-wallpaper/config.json
-    systemd/                  user service + timer
-    tests/                    four standalone test scripts (see "Tests")
+    systemd/                  user service, refresh timer, unlock watcher service
+    tests/                    five standalone test scripts (see "Tests")
 
 After `install.sh` the running copies are `~/.local/bin/wx-wallpaper`,
 `~/.config/wx-wallpaper/config.json`, `~/.config/systemd/user/wx-wallpaper.*` and
@@ -165,19 +193,20 @@ developing so edits here take effect on the next refresh.
 
 ## How a refresh flows
 
-    systemd timer (*/15, +40s after login)
-        │
-        ▼
+    systemd timer (*/15, +40s after login)   unlock watcher (ActiveChanged=false)
+        │                                         │
+        ▼                                         ▼
     main() ── resolve_place(cfg) ──────────────────────────────────────────────
         │      networks[SSID] → pinned lat/lon → place geocode → public IP
         │      anything discovered is written back into the config
         ▼
-    fetch_weather(lat, lon, cfg, place)
+    fetch_weather_retry()   retries the chain with doubling waits (login DNS race)
         │      ├─ fetch_arso()       vreme.si API ── translate ─┐
         │      │                       (fails → try next)       │
         │      └─ fetch_open_meteo()                            ├─ one common shape
         │                                                     ┘
-        │      both failed → read last-weather.json (footer gains "· cached")
+        │      all failed → read last-weather.json; footer gains "· cached",
+        │        or "· stale" plus dropped "now" values when older than stale_after_min
         ▼
     render(data, cfg, label, w, h, dark)
         │      base wallpaper ─ tint ─ shadow ─ glass layer (hud_opacity)
@@ -248,6 +277,18 @@ size; every spacing below is multiplied by it.
   `variation_name` selection. `ICON["sunrise"]` and `ICON["sunset"]` deliberately
   reuse the sun/moon codepoints, so anything matching glyphs by identity must
   dedupe by codepoint.
+* **Stale data loses its glyphs, not its geometry.** When the cached reading is
+  older than `stale_after_min`, the current temperature, condition, wind and
+  instant chips draw nothing — but the number slot is still measured with
+  `temp_m` (a stand-in `"0°"`) so a stale panel and a fresh one differ only by
+  missing text, never by size or position. `LAST_LAYOUT` carries `stale`,
+  `temp_text`, `chips` and `cell_behind`, so tests can assert both the state and
+  the pixels (an empty slot must measure zero lit pixels, the same slot on a
+  fresh panel must not).
+* **Past-cell blanking is gated on staleness.** Hourly cells draw their label,
+  then skip icon/temperature/precipitation when `behind and stale`; a live feed
+  starts at the current hour, so the gate only ever fires for cached readings
+  (and keeps fixed-timestamp test payloads drawing full cells).
 * **Opacity is verifiable.** `hud_text_opacity` lands in `LAST_LAYOUT`, and tests
   compare rendered pixel values rather than trusting the arithmetic.
 
@@ -273,11 +314,12 @@ its numbers came from.
 
 ## Tests
 
-Four standalone scripts, no test runner needed:
+Five standalone scripts, no test runner needed:
 
     python3 tests/check_providers.py   # ~40 s, hits the network
     python3 tests/check_strip.py       # ~2 min
     python3 tests/check_networks.py    # ~5 s
+    python3 tests/check_freshness.py   # ~30 s
     python3 tests/selftest.py          # ~4 min, 152 layout combinations
 
 They import the repository copy of the script. Set `WX_SCRIPT` to test the
@@ -295,6 +337,15 @@ What they guard:
   and empty feeds), both precipitation dialects (probability and millimetres),
   the cached-reading footer, the text-vs-glass opacity rule, and that the big
   temperature stays centred between its neighbours without touching either.
+* `check_freshness.py` — the retry ladder of `fetch_weather_retry` (with
+  `fetch_weather` and `time.sleep` stubbed, so backoff waits are observed, not
+  slept), the unlock decision (`unlock_seen` / `unlock_refresh_due` fed captured
+  `gdbus monitor` lines, plus the config and cache-age gates), and the stale
+  panel: empty number slot that keeps its size and fills on a fresh panel,
+  instant chips dropped while daily ones survive, exactly the left-behind cells
+  flagged and pixel-empty, and the cached-vs-stale footer wording. Timestamps
+  in test payloads sit off the exact hour so nothing ever lands on the
+  60-minute boundary and goes time-dependent.
 * `check_networks.py` — SSID detection (assoc SSID, fallback to the active
   802-11-wireless profile, `None` when wired or `nmcli` is missing) and the whole
   Wi-Fi → place → coordinates precedence, with the network calls mocked.
@@ -306,8 +357,9 @@ What they guard:
 
 * ARSO covers Slovenia only, and its API is undocumented — treat any parsing
   change there as something to re-verify against a live reply.
-* A cached panel shows the weather as of the last successful fetch; the footer
-  says so, but nothing else warns you.
+* A cached panel shows the weather as of the last successful fetch; past the
+  stale limit it hides what is no longer true, but future hours still carry the
+  forecast values from that fetch — a forecast that aged is still that forecast.
 * On GNOME 50 the screenshot D-Bus API is refused (`Screenshot is not allowed`)
   and `org.gnome.mutter unsafe-mode` no longer exists, so visual changes can only
   be verified by measuring rendered pixels — which is what the tests do.

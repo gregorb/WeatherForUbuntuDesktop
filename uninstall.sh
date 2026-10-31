@@ -15,10 +15,11 @@ case "${1:-}" in
     *)       echo "usage: $0 [--purge]" >&2; exit 2 ;;
 esac
 
-if systemctl --user is-enabled wx-wallpaper.timer >/dev/null 2>&1; then
-    systemctl --user disable --now wx-wallpaper.timer
-fi
+for unit in wx-wallpaper.timer wx-wallpaper-unlock.service; do
+    systemctl --user disable --now "$unit" 2>/dev/null || true
+done
 rm -f "$CONFIG_HOME/systemd/user/wx-wallpaper.service" \
+      "$CONFIG_HOME/systemd/user/wx-wallpaper-unlock.service" \
       "$CONFIG_HOME/systemd/user/wx-wallpaper.timer"
 systemctl --user daemon-reload
 rm -f "$HOME/.local/bin/wx-wallpaper"

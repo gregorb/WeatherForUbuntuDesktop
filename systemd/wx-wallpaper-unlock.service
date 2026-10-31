@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh the weather wallpaper when the desktop is unlocked
+Documentation=file://%h/WeatherForUbuntuDesktop/README.md
+# lives and dies with the graphical session
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wx-wallpaper --watch-unlock
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

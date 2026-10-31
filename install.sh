@@ -57,12 +57,18 @@ else
 fi
 
 # ---------------------------------------------------------------- scheduling
-for unit in wx-wallpaper.service wx-wallpaper.timer; do
+for unit in wx-wallpaper.service wx-wallpaper-unlock.service wx-wallpaper.timer; do
     install -m 0644 "$HERE/systemd/$unit" "$UNIT_DIR/$unit"
 done
 systemctl --user daemon-reload
 systemctl --user enable --now wx-wallpaper.timer
 echo "enabled   wx-wallpaper.timer (every 15 minutes)"
+if systemctl --user enable --now wx-wallpaper-unlock.service 2>/dev/null; then
+    echo "enabled   wx-wallpaper-unlock.service (refresh on unlock)"
+else
+    echo "note:     could not start wx-wallpaper-unlock.service now (no graphical"
+    echo "          session yet?); it will start on the next login"
+fi
 
 # ---------------------------------------------------------------- first render
 echo

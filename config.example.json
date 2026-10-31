@@ -26,5 +26,10 @@
   "width_frac": 1.2,
   "keep_files": 5,
   "timeout": 15,
-  "hud_text_opacity": null
+  "hud_text_opacity": null,
+  "fetch_retries": 2,
+  "fetch_retry_wait": 15,
+  "stale_after_min": 60,
+  "refresh_on_unlock": true,
+  "unlock_min_gap": 300
 }
