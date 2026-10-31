@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""wx-wallpaper - render the current weather onto the GNOME desktop background.
+
+Ubuntu/GNOME (Wayland) gives you one reliable hook for the wallpaper:
+    gsettings set org.gnome.desktop.background picture-uri(-dark) file://...
+The shell reloads that image only when the *path* changes, so every render is
+written to a fresh timestamped file. The HUD is composited on top of your normal
+wallpaper, so the desktop still looks like your desktop.
+
+    wx-wallpaper            fetch, render, apply
+    wx-wallpaper --dry-run  render to a preview file, leave the desktop alone
+    wx-wallpaper --status   show config + last render
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wx-wallpaper"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "wx-wallpaper"
+CACHE_FILE = DATA_DIR / "last-weather.json"
+
+DEFAULTS = {
+    # Where to report weather for. "auto" geolocates from your public IP.
+    "place": "auto",
+    "latitude": None,
+    "longitude": None,
+    "place_name": None,          # label shown on the wallpaper; guessed if null
+    "units": "metric",           # "metric" or "imperial"
+    # What the HUD is drawn on top of. Kept as the Ubuntu defaults.
+    "base_light": "/usr/share/backgrounds/warty-final-ubuntu.png",
+    "base_dark": "/usr/share/backgrounds/ubuntu-wallpaper-d.png",
+    "resolution": None,          # null -> detect from Mutter, else "1920x1080"
+    # Where the panel sits. anchor_x/anchor_y pick the edge, the margins are the
+    # inset from that edge as a fraction of the screen size.
+    "anchor_x": "right",         # left / center / right
+    "anchor_y": "center",        # top / center / bottom
+    "margin_x_frac": 0.10,
+    "margin_y_frac": 0.05,
+    "panel_scale": 0.5,
+    "hourly": "strip",           # strip = 12 hour-by-hour cells, line = trend
+                                 # sparkline, off = leave it out
+    "hud_opacity": 0.75,         # 1.0 = solid panel, 0.75 = 75% visible
+    # null = text stays clearer than the glass it sits on; set a number to pin it
+    "hud_text_opacity": None,
+    # Wi-Fi SSID -> place. Checked before the default location below, so the
+    # wallpaper follows you between, say, home and work. A value may also be
+    # {"name": "...", "latitude": ..., "longitude": ...} to skip geocoding.
+    # Weather providers, tried in order: ARSO (vreme.si, Slovenian agency) then
+    # the documented global Open-Meteo. Drop "arso" to skip it entirely.
+    "providers": ["arso", "open-meteo"],
+    "networks": {},
+    "place_coords": {},          # auto-filled: place name -> [lat, lon]
+    "arso_places": {},           # auto-filled: place name -> ARSO location
+    "width_frac": 1.0,           # panel width as a multiple of its natural width;
+                                 # the hourly strip spreads to fill the extra room
+    "keep_files": 5,
+    "timeout": 15,
+}
+
+FA = "/usr/share/fonts/opentype/font-awesome/FontAwesome.otf"
+UBUNTU = "/usr/share/fonts/truetype/ubuntu"
+ICON = {
+    "sun": "\uf185", "moon": "\uf186", "cloud": "\uf0c2", "bolt": "\uf0e8",
+    "drop": "\uf043", "snow": "\uf2dc", "umbrella": "\uf0e9", "therm": "\uf2cb",
+    # used for the day/night high+low chips
+    "sunrise": "\uf185", "sunset": "\uf186", "pin": "\uf041",
+}
+# WMO weather interpretation codes -> (label, icon, sky tint rgba)
+WMO = {
+    0:  ("Clear", "sun", (255, 196, 120)),
+    1:  ("Mostly clear", "sun", (255, 205, 140)),
+    2:  ("Partly cloudy", "cloud", (200, 205, 215)),
+    3:  ("Overcast", "cloud", (165, 170, 180)),
+    45: ("Fog", "cloud", (190, 195, 200)),
+    48: ("Freezing fog", "cloud", (190, 200, 210)),
+    51: ("Light drizzle", "drop", (120, 170, 215)),
+    53: ("Drizzle", "drop", (120, 170, 215)),
+    55: ("Heavy drizzle", "drop", (110, 160, 210)),
+    56: ("Freezing drizzle", "drop", (150, 200, 225)),
+    57: ("Freezing drizzle", "drop", (150, 200, 225)),
+    61: ("Light rain", "umbrella", (105, 155, 205)),
+    63: ("Rain", "umbrella", (100, 150, 205)),
+    65: ("Heavy rain", "umbrella", (90, 135, 195)),
+    66: ("Freezing rain", "umbrella", (140, 190, 220)),
+    67: ("Freezing rain", "umbrella", (140, 190, 220)),
+    71: ("Light snow", "snow", (205, 225, 240)),
+    73: ("Snow", "snow", (205, 225, 240)),
+    75: ("Heavy snow", "snow", (210, 230, 245)),
+    77: ("Snow grains", "snow", (210, 230, 245)),
+    80: ("Light showers", "umbrella", (105, 160, 210)),
+    81: ("Showers", "umbrella", (100, 155, 205)),
+    82: ("Violent showers", "umbrella", (90, 140, 200)),
+    85: ("Snow showers", "snow", (205, 225, 240)),
+    86: ("Heavy snow showers", "snow", (210, 230, 245)),
+    95: ("Thunderstorm", "bolt", (150, 130, 215)),
+    96: ("Thunder, hail", "bolt", (150, 130, 215)),
+    99: ("Thunder, hail", "bolt", (150, 130, 215)),
+}
+NIGHT_TINT = (35, 45, 90)
+LAST_LAYOUT = {}               # panel geometry from the most recent render()
+COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def log(msg):
+    print(f"[wx-wallpaper] {msg}", file=sys.stderr)
+
+
+# ----------------------------------------------------------------- config
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG_FILE.exists():
+        try:
+            raw = json.loads(CONFIG_FILE.read_text())
+            # older configs positioned the panel with a single "corner" key
+            if "corner" in raw and "anchor_x" not in raw and "anchor_y" not in raw:
+                cfg["anchor_x"] = "right" if raw["corner"].endswith("right") else "left"
+                cfg["anchor_y"] = "bottom" if raw["corner"].startswith("bottom") else "top"
+            cfg.update(raw)
+        except Exception as exc:
+            log(f"warning: bad config {CONFIG_FILE}: {exc}")
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def http_json(url, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": "wx-wallpaper/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def active_ssid(cfg):
+    """The Wi-Fi network we are associated with, or None when wired/absent."""
+    if not cfg.get("networks"):
+        return None                      # nothing configured: don't even ask
+    try:
+        out = sh(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"], timeout=5).stdout
+        for line in out.splitlines():
+            active, _, ssid = line.partition(":")   # SSIDs may contain ':'
+            if active.strip() == "yes" and ssid.strip():
+                return ssid.strip()
+        # association not reported: fall back to the active wireless profile name
+        out = sh(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection",
+                  "show", "--active"], timeout=5).stdout
+        for line in out.splitlines():
+            parts = [f.strip() for f in line.split(":")]
+            if len(parts) >= 2 and parts[1] == "802-11-wireless" and parts[0]:
+                return parts[0]
+    except Exception as exc:
+        log(f"wi-fi lookup failed: {exc}")
+    return None
+
+
+def coords_for(name, cfg):
+    """Coordinates for a place name, from the geocode cache or the geocoder."""
+    cache = cfg.setdefault("place_coords", {})
+    hit = cache.get(name)
+    if hit:
+        return float(hit[0]), float(hit[1])
+    q = urllib.parse.urlencode({"name": name, "count": 1, "language": "en",
+                                "format": "json"})
+    r = http_json(f"https://geocoding-api.open-meteo.com/v1/search?{q}",
+                  cfg["timeout"])["results"][0]
+    cache[name] = [round(r["latitude"], 4), round(r["longitude"], 4)]
+    return r["latitude"], r["longitude"]
+
+
+def resolve_place(cfg):
+    """Decide which place to report weather for.
+
+    A mapped Wi-Fi network wins over the default location. Returns
+    (lat, lon, label, source). Anything discovered is recorded back into cfg --
+    geocoded coordinates, pinned defaults -- so a later geolocation outage
+    cannot leave the wallpaper stale; main() persists cfg.
+    """
+    ssid = active_ssid(cfg)
+    mapped = cfg.get("networks", {}).get(ssid) if ssid else None
+    if mapped:
+        if isinstance(mapped, dict):
+            name = str(mapped.get("name") or ssid)
+            if mapped.get("latitude") is not None and mapped.get("longitude") is not None:
+                return (float(mapped["latitude"]), float(mapped["longitude"]),
+                        name, f"Wi-Fi {ssid}")
+        else:
+            name = str(mapped)
+        try:
+            lat, lon = coords_for(name, cfg)
+            return lat, lon, name, f"Wi-Fi {ssid}"
+        except Exception as exc:
+            log(f"no coordinates for '{name}' (mapped from Wi-Fi '{ssid}'): {exc}; "
+                "trying the default location")
+
+    if cfg.get("latitude") is not None and cfg.get("longitude") is not None:
+        return (float(cfg["latitude"]), float(cfg["longitude"]),
+                cfg.get("place_name") or "Home", "default")
+
+    t = cfg["timeout"]
+    place = cfg.get("place") or "auto"
+    if place != "auto":
+        try:
+            lat, lon = coords_for(place, cfg)
+            label = cfg.get("place_name") or place
+            cfg["latitude"], cfg["longitude"] = round(lat, 4), round(lon, 4)
+            cfg["place_name"] = label
+            return lat, lon, label, "default"
+        except Exception as exc:
+            log(f"geocoding '{place}' failed ({exc}); falling back to IP")
+
+    lat = lon = None
+    label = None
+    for svc in ("https://ipapi.co/json/", "https://ipwho.is/"):
+        try:
+            j = http_json(svc, t)
+            if "latitude" in j and j.get("latitude") is not None:
+                lat, lon = float(j["latitude"]), float(j["longitude"])
+                label = j.get("city") or j.get("region") or None
+                break
+        except Exception as exc:
+            log(f"IP geolocation via {svc} failed: {exc}")
+    if lat is None:
+        raise RuntimeError("no location: map a Wi-Fi network, or set "
+                           f"latitude/longitude or place, in {CONFIG_FILE}")
+    label = cfg.get("place_name") or label or "Home"
+    cfg["latitude"], cfg["longitude"] = round(lat, 4), round(lon, 4)
+    cfg["place_name"] = label
+    return lat, lon, label, "public IP"
+
+
+# ---------------------------------------------------------------- providers
+
+# ARSO (the Slovenian environment agency) runs vreme.si; this is the JSON API the
+# site itself calls. It is not documented, so it is the primary source with
+# Open-Meteo -- which is documented and global -- behind it as a fallback.
+ARSO_SEARCH = "https://www.vreme.si/api/1.0/locations/"
+ARSO_LOCATION = "https://www.vreme.si/api/1.0/location/"
+ARSO_CLOUD = {"clear": 0, "partCloudy": 1, "prevCloudy": 2, "overcast": 3}
+# WMO codes per phenomenon, indexed by intensity (light, moderate, heavy)
+ARSO_PHENOM = {
+    "DZ": (51, 53, 55), "RA": (61, 63, 65), "SN": (71, 73, 75),
+    "FZDZ": (56, 56, 57), "FZRA": (66, 66, 67), "PL": (66, 67, 67),
+    "FG": (45, 45, 48), "TS": (95, 95, 96), "GR": (96, 96, 99),
+}
+ARSO_INTENSITY = {"light": 0, "mod": 1, "moderate": 1, "heavy": 2, "ter": 2}
+# ddff_icon carries an English compass point ("lightNE"); dd_shortText is Slovene,
+# where S means "sever" (north) -- so prefer the English one.
+ARSO_SL_COMPASS = {"S": 0, "SV": 45, "V": 90, "JV": 135, "J": 180,
+                   "JZ": 225, "Z": 270, "SZ": 315}
+EN_COMPASS = {"N": 0, "NE": 45, "E": 90, "SE": 135, "S": 180,
+              "SW": 225, "W": 270, "NW": 315}
+
+
+def arso_decode(icon):
+    """'overcast_lightRA_night' -> (wmo code, is_day); 'lightRA' also occurs."""
+    if not icon:
+        return None, None
+    parts = icon.split("_")
+    is_day = None
+    if parts and parts[-1] in ("day", "night"):
+        is_day = parts[-1] == "day"
+        parts = parts[:-1]
+    code = None
+    for token in parts:
+        if token in ARSO_CLOUD:
+            code = ARSO_CLOUD[token]
+            continue
+        m = re.match(r"(light|mod|moderate|heavy|ter)?([A-Z]{2,4})$", token)
+        if m and m.group(2) in ARSO_PHENOM:
+            code = ARSO_PHENOM[m.group(2)][ARSO_INTENSITY.get(m.group(1), 1)]
+    return code, is_day
+
+
+def arso_direction(row):
+    """Wind direction in degrees, preferring the unambiguous English icon."""
+    m = re.search(r"([NSEW]{1,2})$", row.get("ddff_icon") or "")
+    if m and m.group(1) in EN_COMPASS:
+        return float(EN_COMPASS[m.group(1)])
+    sl = (row.get("dd_shortText") or "").strip().upper()
+    if sl in ARSO_SL_COMPASS:
+        return float(ARSO_SL_COMPASS[sl])
+    return 0.0
+
+
+def _arso_queries(place):
+    """ARSO matches on a leading fragment of its own title, which is often shorter
+    than what the user wrote ('Zagorje' for 'Zagorje ob Savi'). Try whole name,
+    then drop trailing words, then try without diacritics."""
+    words = [w for w in re.split(r"[,\s]+", place.strip()) if w]
+    tries, seen = [], set()
+
+    def add(text):
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            tries.append(text)
+
+    for n in range(len(words), 0, -1):
+        add(" ".join(words[:n]))
+        folded = "".join(c for c in unicodedata.normalize("NFKD", " ".join(words[:n]))
+                         if not unicodedata.combining(c))
+        add(folded)
+    return tries
+
+
+def arso_title(lat, lon, place, cfg):
+    """ARSO's own name for our place, nearest to our coordinates, cached."""
+    cache = cfg.setdefault("arso_places", {})
+    hit = cache.get(place)
+    if hit:
+        return hit["title"]
+    feats = []
+    for query in _arso_queries(place):
+        q = urllib.parse.urlencode({"loc": query, "lang": "en"})
+        feats = http_json(f"{ARSO_SEARCH}?{q}", cfg["timeout"]).get("features") or []
+        if feats:
+            break
+    if not feats:
+        raise RuntimeError(f"no ARSO place matches '{place}' (ARSO covers Slovenia)")
+
+    def away(feat):
+        flon, flat = feat["geometry"]["coordinates"]
+        return (flat - lat) ** 2 + (flon - lon) ** 2
+
+    best = min(feats, key=away)
+    if math.sqrt(away(best)) > 0.35:      # ~35 km: a different town, not ours
+        raise RuntimeError(f"nearest ARSO place '{best['properties']['title']}' is "
+                           "too far from the configured coordinates")
+    flon, flat = best["geometry"]["coordinates"]
+    title = best["properties"]["title"]
+    cache[place] = {"title": title, "latitude": flat, "longitude": flon}
+    return title
+
+
+def _arso_tz(day):
+    """Fixed offset from a day's 'UTCoffset' field, e.g. '+01:00'."""
+    raw = (day.get("UTCoffset") or "").strip()
+    m = re.match(r"([+-])(\d{2}):?(\d{2})$", raw)
+    if not m:
+        return None
+    delta = timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+    return timezone(delta if m.group(1) == "+" else -delta)
+
+
+def _arso_rows(block):
+    out = []
+    try:
+        days = block["features"][0]["properties"]["days"]
+    except (KeyError, IndexError, TypeError):
+        return out
+    for day in days or []:
+        for row in day.get("timeline") or []:
+            out.append((day, row))
+    return out
+
+
+def _num(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _local(valid, tz):
+    """'2026-10-30T19:00:00+00:00' -> 'YYYY-MM-DDTHH:MM' in the place's own zone."""
+    try:
+        dt = datetime.fromisoformat(valid)
+    except (TypeError, ValueError):
+        return None
+    if tz is not None:
+        dt = dt.astimezone(tz)
+    return dt.strftime("%Y-%m-%dT%H:%M")
+
+
+def fetch_arso(lat, lon, cfg, place):
+    """ARSO/vreme.si, translated into the same shape Open-Meteo gives us."""
+    t = cfg["timeout"]
+    title = arso_title(lat, lon, place, cfg)
+    q = urllib.parse.urlencode({"lang": "en", "location": title})
+    d = http_json(f"{ARSO_LOCATION}?{q}", t)
+
+    obs = _arso_rows(d.get("observation"))
+    if not obs:
+        raise RuntimeError("ARSO returned no observation")
+    day, row = obs[-1]
+    tz = _arso_tz(day)
+    code, is_day = arso_decode(row.get("clouds_icon_wwsyn_icon") or row.get("wwsyn_icon"))
+    if code is None:
+        code, is_day = 3, None
+    if is_day is None:                     # fall back to the local clock + sun times
+        sr, ss = day.get("sunrise"), day.get("sunset")
+        hour = (datetime.fromisoformat(row["valid"]).astimezone(tz).hour
+                if tz and row.get("valid") else datetime.now().hour)
+        try:
+            is_day = int(datetime.fromisoformat(sr)[11:13]) <= hour < int(
+                datetime.fromisoformat(ss)[11:13])
+        except (TypeError, ValueError, IndexError):
+            is_day = 6 <= hour < 18
+
+    wind_ms = _num(row.get("ff_val"), 0.0) or 0.0
+    imperial = cfg["units"] == "imperial"
+    wind = wind_ms * (2.23694 if imperial else 3.6)      # m/s -> mph / km/h
+
+    hourly, acc = [], None
+    for hday, hrow in _arso_rows(d.get("forecast1h")):
+        stamp = _local(hrow.get("valid"), _arso_tz(hday) or tz)
+        temp = _num(hrow.get("t"))
+        if not stamp or temp is None:
+            continue
+        amount = _num(hrow.get("tp_acc"))
+        if amount is None:
+            delta = 0.0
+        elif acc is None:
+            delta = amount
+        else:
+            delta = max(0.0, amount - acc)      # tp_acc accumulates; resets to 0
+        acc = amount if acc is None or amount >= acc else amount
+        hcode, _ = arso_decode(hrow.get("clouds_icon_wwsyn_icon") or hrow.get("wwsyn_icon"))
+        hourly.append((stamp, temp, hcode if hcode is not None else code,
+                       round(delta, 1)))
+
+    daily_max = daily_min = None
+    for _, drow in _arso_rows(d.get("forecast24h")):
+        daily_max, daily_min = _num(drow.get("txsyn")), _num(drow.get("tnsyn"))
+        break
+    if daily_max is None or daily_min is None:      # hourly-only fallback
+        temps = [h[1] for h in hourly]
+        daily_max = daily_max if daily_max is not None else (max(temps) if temps else None)
+        daily_min = daily_min if daily_min is not None else (min(temps) if temps else None)
+
+    if imperial:
+        to_f = lambda c: round(c * 9 / 5 + 32, 1)
+        temp_now = to_f(_num(row.get("t"), 0.0))
+        temps_h = [(s, to_f(tv), c, p) for s, tv, c, p in hourly]
+        dmax, dmin = to_f(daily_max), to_f(daily_min)
+    else:
+        temp_now = _num(row.get("t"), 0.0)
+        temps_h = hourly
+        dmax, dmin = daily_max, daily_min
+
+    sr, ss = day.get("sunrise"), day.get("sunset")
+    data = {
+        "current": {
+            "time": _local(row.get("valid"), tz) or datetime.now().strftime("%Y-%m-%dT%H:%M"),
+            "temperature_2m": temp_now,
+            "apparent_temperature": None,        # ARSO does not publish feels-like
+            "relative_humidity_2m": _num(row.get("rh"), 0),
+            "weather_code": code,
+            "wind_speed_10m": round(wind, 1),
+            "wind_direction_10m": arso_direction(row),
+            "is_day": 1 if is_day else 0,
+            "precipitation": hourly[0][3] if hourly else 0.0,
+        },
+        "hourly": {
+            "time": [h[0] for h in hourly],
+            "temperature_2m": [h[1] for h in hourly],
+            "weather_code": [h[2] for h in hourly],
+            "precip": [h[3] for h in hourly],    # millimetres fallen in that hour
+            "precip_kind": "mm",
+        },
+        "daily": {
+            "temperature_2m_max": [dmax] if dmax is not None else [],
+            "temperature_2m_min": [dmin] if dmin is not None else [],
+            "weather_code": [code],
+            "sunrise": [sr] if sr else [],
+            "sunset": [ss] if ss else [],
+        },
+        "latitude": lat, "longitude": lon, "provider": "ARSO",
+        "provider_place": title,
+    }
+    if not hourly:
+        raise RuntimeError("ARSO returned no forecast rows")
+    return data
+
+
+def fetch_open_meteo(lat, lon, cfg):
+    """Documented global provider; also the fallback when ARSO fails."""
+    imperial = cfg["units"] == "imperial"
+    params = {
+        "latitude": round(lat, 4), "longitude": round(lon, 4),
+        "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                   "weather_code,wind_speed_10m,wind_direction_10m,is_day,precipitation",
+        "hourly": "temperature_2m,weather_code,precipitation_probability",
+        "daily": "temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset",
+        # 2 days so the strip still has 12 hours to show late in the evening
+        "forecast_days": 2,
+        "timezone": "auto",
+    }
+    if imperial:
+        params.update({"temperature_unit": "fahrenheit", "wind_speed_unit": "mph"})
+    url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params)
+    data = http_json(url, cfg["timeout"])
+    probs = data.get("hourly", {}).get("precipitation_probability")
+    if probs is not None:
+        data["hourly"]["precip"] = probs
+        data["hourly"]["precip_kind"] = "prob"
+    data["provider"] = "Open-Meteo"
+    return data
+
+
+def fetch_weather(lat, lon, cfg, place):
+    """First provider that answers wins; the rest are fallbacks."""
+    wanted = cfg.get("providers") or ["arso", "open-meteo"]
+    if isinstance(wanted, str):
+        wanted = [wanted]
+    errors = []
+    for name in wanted:
+        try:
+            if name == "arso":
+                data = fetch_arso(lat, lon, cfg, place)
+            elif name == "open-meteo":
+                data = fetch_open_meteo(lat, lon, cfg)
+            else:
+                raise RuntimeError(f"unknown provider '{name}'")
+            if errors:
+                log("fell back to {}: {}".format(name, "; ".join(errors)))
+            return data
+        except Exception as exc:
+            log(f"provider {name} failed: {exc}")
+            errors.append(f"{name}: {exc}")
+    raise RuntimeError("no weather provider answered (" + "; ".join(errors) + ")")
+
+
+# --------------------------------------------------------------- gsettings
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def detect_resolution(cfg):
+    if cfg.get("resolution"):
+        return tuple(int(v) for v in cfg["resolution"].lower().split("x"))
+    # Mutter prints the whole display state as a GVariant tuple; mine the mode
+    # tuples and keep the ones flagged 'is-current'.
+    try:
+        out = sh(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.DisplayConfig",
+                  "--object-path", "/org/gnome/Mutter/DisplayConfig",
+                  "--method", "org.gnome.Mutter.DisplayConfig.GetCurrentState"]).stdout
+        modes = re.findall(
+            r"\('\d+x[\d.]+',\s*(\d+),\s*(\d+),\s*[\d.]+,\s*[\d.]+,\s*\[[^\]]*\],\s*\{([^}]*)\}\)",
+            out)
+        current = [(int(w), int(h)) for w, h, props in modes if "is-current" in props]
+        if current:
+            return max(current, key=lambda wh: wh[0] * wh[1])
+    except Exception as exc:
+        log(f"resolution probe failed: {exc}")
+    return (1920, 1080)
+
+
+def dark_mode():
+    r = sh(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"])
+    return "dark" in r.stdout
+
+
+def apply_wallpaper(path):
+    """Point GNOME at path. A new path each time is what forces a reload."""
+    uri = "file://" + urllib.parse.quote(str(path))
+    for key in ("picture-uri", "picture-uri-dark"):
+        r = sh(["gsettings", "set", "org.gnome.desktop.background", key, uri])
+        if r.returncode:
+            raise RuntimeError(f"gsettings set {key} failed: {r.stderr.strip()}")
+    sh(["gsettings", "set", "org.gnome.desktop.background", "picture-options", "scaled"])
+
+
+def prune(keep):
+    files = sorted(DATA_DIR.glob("wx-*.png"))
+    for old in files[:-keep] if keep > 0 else files:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ drawing
+
+class Fonts:
+    def __init__(self, s):
+        self.big = ImageFont.truetype(f"{UBUNTU}/Ubuntu-Th.ttf", int(205 * s))
+        self.cond = ImageFont.truetype(f"{UBUNTU}/Ubuntu-M.ttf", int(42 * s))
+        self.label = ImageFont.truetype(f"{UBUNTU}/Ubuntu-M.ttf", int(31 * s))
+        self.body = ImageFont.truetype(f"{UBUNTU}/Ubuntu-R.ttf", int(29 * s))
+        self.small = ImageFont.truetype(f"{UBUNTU}/Ubuntu-M.ttf", int(28 * s))
+        self.tiny = ImageFont.truetype(f"{UBUNTU}/Ubuntu-R.ttf", int(21 * s))
+        self.icon_s = ImageFont.truetype(FA, int(26 * s))
+        self.icon_xl = ImageFont.truetype(FA, int(96 * s))
+
+
+def grad(size, top, bottom):
+    """Vertical alpha gradient, RGBA."""
+    w, h = size
+    strip = Image.new("L", (1, h))
+    px = strip.load()
+    for y in range(h):
+        f = y / max(h - 1, 1)
+        px[0, y] = int(top + (bottom - top) * f)
+    return strip.resize((w, h))
+
+
+def tint(base, rgb, strength):
+    w, h = base.size
+    overlay = Image.new("RGBA", (w, h), rgb + (0,))
+    overlay.putalpha(grad((w, h), int(strength * 1.35), int(strength * 0.35)))
+    base.alpha_composite(overlay)
+
+
+def rounded(draw, box, radius, fill=None, outline=None, width=1):
+    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
+
+def precip_text(value, kind):
+    """Open-Meteo reports a probability, ARSO reports millimetres fallen."""
+    if kind == "mm":
+        return f"{value:.1f}".rstrip("0").rstrip(".") + "mm"
+    return f"{round(value)}%"
+
+
+def soft_alpha(a, bright=240):
+    """Alpha for a faint text run: lifted halfway toward the bright text, which
+    starts at 240, without ever reaching it. Fainter runs therefore gain more
+    than louder ones, and the hierarchy inside the panel survives."""
+    return a if a >= bright else int(a + (bright - a) * 0.5)
+
+
+def footer_text(data, now):
+    """Left footer. Says 'cached' when the numbers are the last good reading, so
+    a stale panel cannot be mistaken for a freshly fetched one."""
+    cached_at = data.get("_cached")
+    provider = str(data.get("provider") or "")
+    text = (f"updated {cached_at} · cached" if cached_at
+            else f"updated {now:%H:%M}")
+    return text + (f"  ·  {provider}" if provider else "")
+
+
+def precip_frac(value, kind):
+    """Bar fill: probability over 100%, millimetres over a wet 4 mm hour."""
+    if kind == "mm":
+        return min(1.0, max(0.0, value / 4.0))
+    return min(1.0, max(0.0, value / 100.0))
+
+
+def dir_arrow(size, deg, color):
+    """Small arrow pointing the way the wind blows *to*."""
+    s = size
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    c = s / 2
+    r = s * 0.40
+    # up = north
+    pts = [(c, c - r), (c - r * 0.52, c + r * 0.72), (c, c + r * 0.34),
+           (c + r * 0.52, c + r * 0.72)]
+    d.polygon(pts, fill=color)
+    return img.rotate(deg, resample=Image.Resampling.BICUBIC, expand=False)
+
+
+def sparkline(img, fonts, xy, w, h, hours, temps, line_col, text_col):
+    if len(temps) < 2:
+        return
+    d = ImageDraw.Draw(img, "RGBA")
+    x0, y0 = xy
+    lo, hi = min(temps), max(temps)
+    span = (hi - lo) or 1.0
+    pad = h * 0.18
+    pts = []
+    for i, t in enumerate(temps):
+        px = x0 + w * i / (len(temps) - 1)
+        py = y0 + h - pad - (h - 2 * pad) * (t - lo) / span
+        pts.append((px, py))
+
+    # area under the curve
+    area = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ad = ImageDraw.Draw(area)
+    ad.polygon(pts + [(pts[-1][0], y0 + h), (pts[0][0], y0 + h)],
+               fill=line_col[:3] + (48,))
+    img.alpha_composite(area)
+
+    d.line(pts, fill=line_col, width=3, joint="curve")
+    for i, (px, py) in enumerate(pts):
+        d.ellipse([px - 3.5, py - 3.5, px + 3.5, py + 3.5], fill=line_col)
+        if i % 3 == 0 or i == len(pts) - 1:
+            d.text((px, y0 - 6), f"{round(temps[i])}", font=fonts.tiny,
+                   fill=text_col, anchor="ms")
+    for i in range(0, len(hours), 3):
+        px = x0 + w * i / (len(temps) - 1)
+        d.text((px, y0 + h + 6), hours[i], font=fonts.tiny,
+               fill=text_col[:3] + (int(text_col[3] * 0.75),), anchor="ma")
+
+
+def render(data, cfg, label, w, h, dark):
+    """Compose the weather HUD on top of the normal desktop wallpaper."""
+    base_path = cfg["base_dark"] if dark else cfg["base_light"]
+    try:
+        base = Image.open(base_path).convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
+    except Exception as exc:
+        log(f"base wallpaper {base_path} unavailable ({exc}); using flat fill")
+        base = Image.new("RGBA", (w, h), (24, 28, 38, 255) if dark else (228, 232, 238, 255))
+
+    cur = data["current"]
+    code = int(cur["weather_code"])
+    cond_name, icon_key, tint_rgb = WMO.get(code, ("Unknown", "cloud", (170, 175, 185)))
+    is_day = bool(cur.get("is_day", 1))
+    if icon_key == "sun" and not is_day:
+        icon_key = "moon"
+
+    sky = NIGHT_TINT if not is_day else tint_rgb
+    tint(base, sky, 30 if dark else 22)
+    if not is_day:
+        base.alpha_composite(Image.new("RGBA", (w, h), (4, 6, 18, 26)))
+
+    fg = (247, 249, 253) if dark else (16, 20, 28)
+    fg2 = tuple(int(c * 0.60 + (255 - c) * 0.40) for c in fg)
+    panel_fill = (12, 16, 24, 152) if dark else (250, 251, 253, 182)
+    hairline = (255, 255, 255, 36) if dark else (20, 24, 32, 30)
+    accent = (150, 170, 230) if not is_day else tuple(sky)
+
+    imperial = cfg["units"] == "imperial"
+    deg = "°F" if imperial else "°"
+    wunit = "mph" if imperial else "km/h"
+    now = datetime.now().astimezone()
+
+    # ---------------------------------------------------------------- content
+    hh = data.get("hourly", {})
+    daily = data.get("daily", {})
+    try:
+        idx = next(i for i, t in enumerate(hh["time"])
+                   if t[:13] == cur["time"][:13])
+    except (StopIteration, KeyError, TypeError):
+        idx = 0
+    probs = hh.get("precip") or hh.get("precipitation_probability") or []
+    pkind = hh.get("precip_kind", "prob")
+
+    def precip_at(i):
+        try:
+            return float(probs[i] or 0) if i < len(probs) and probs[i] is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+
+    place_line = f"{label}   {now:%a %H:%M}"
+    temp_str = f"{round(cur['temperature_2m'])}{deg}"
+    wind_txt = (f"{round(cur['wind_speed_10m'])} {wunit} "
+                f"{COMPASS[int((cur['wind_direction_10m'] + 11.25) // 22.5) % 16]}")
+    chips = [("drop", f"{round(cur['relative_humidity_2m'])}%")]
+    feels = cur.get("apparent_temperature")
+    if feels is not None:
+        chips.append(("therm", f"{round(float(feels))}{deg}"))
+    try:
+        chips.append(("sunrise", f"{round(daily['temperature_2m_max'][0])}{deg}"))
+        chips.append(("sunset", f"{round(daily['temperature_2m_min'][0])}{deg}"))
+    except (KeyError, IndexError, TypeError):
+        pass
+    chips.append(("umbrella", precip_text(precip_at(idx), pkind)))
+
+    temps, hours = [], []
+    hp = hh.get("temperature_2m") or []
+    ht = hh.get("time") or []
+    for i in range(idx, min(idx + 12, len(hp))):
+        try:
+            temps.append(float(hp[i]))
+            hours.append(ht[i][11:16])
+        except (TypeError, ValueError, IndexError):
+            break
+
+    # hour-by-hour: (label, icon, temperature, chance of precip)
+    codes = hh.get("weather_code") or []
+    try:
+        dawn = int(daily["sunrise"][0][11:13])
+        dusk = int(daily["sunset"][0][11:13])
+    except (KeyError, IndexError, TypeError, ValueError):
+        dawn, dusk = 6, 18
+    cols = []
+    for i in range(idx, min(idx + 12, len(hp))):
+        try:
+            value = float(hp[i])
+        except (TypeError, ValueError, IndexError):
+            break
+        hour = int(ht[i][11:13]) if i < len(ht) else now.hour
+        wcode = codes[i] if i < len(codes) and codes[i] is not None else code
+        try:
+            ik = WMO.get(int(wcode), ("", "cloud", None))[1]
+        except (TypeError, ValueError):
+            ik = "cloud"
+        if ik == "sun" and not dawn <= hour < dusk:
+            ik = "moon"
+        pval = precip_at(i)
+        cols.append((ht[i][11:16] if i < len(ht) else f"{hour:02d}", ik,
+                     f"{round(value)}{deg}", precip_text(pval, pkind), pval, pkind))
+
+    foot_l = footer_text(data, now)
+    foot_r = ""
+    try:
+        foot_r = (f"sunrise {daily['sunrise'][0][11:16]}   "
+                  f"sunset {daily['sunset'][0][11:16]}")
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    # --------------------------------------------- measure, then size the panel
+    mx = int(cfg["margin_x_frac"] * w)
+    my = int(cfg["margin_y_frac"] * h)
+    s = cfg["panel_scale"] * (min(w, h) / 1080.0)
+    hourly = cfg.get("hourly", "strip")
+    width_frac = max(1.0, float(cfg.get("width_frac", 1.0)))
+    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+
+    def layout(s):
+        f = Fonts(s)
+        inner = int(30 * s)
+        gap_a = int(20 * s)
+        gap_b = int(24 * s)
+        gap_c = int(20 * s)
+        spark_h = int(58 * s)
+        tick_h = int(24 * s)
+        foot_h = int(24 * s)
+        hour_h = int(21 * s)
+        icon_h = int(28 * s)
+        temp_h = int(31 * s)
+        rain_h = int(21 * s)
+        bar_h = max(2, int(5 * s))
+        strip_h = hour_h + icon_h + temp_h + rain_h + bar_h + int(12 * s)
+        cell_w = int(30 * s)
+        if cols:
+            cell_w = max([cell_w]
+                         + [int(12 * s) + int(probe.textlength(c[2], font=f.label))
+                            for c in cols]
+                         + [int(10 * s) + int(probe.textlength(c[3], font=f.tiny))
+                            for c in cols])
+        strip_w = cell_w * len(cols)          # narrowest the strip can be; it may
+                                              # later be spread across a wider panel
+
+        tw = probe.textlength(temp_str, font=f.big)
+        th = f.big.getbbox(temp_str)[3] - f.big.getbbox(temp_str)[1]
+        iw = f.icon_xl.getbbox(ICON[icon_key])[2]
+        cw = probe.textlength(cond_name, font=f.cond)
+        ww = probe.textlength(wind_txt, font=f.body) + int(40 * s)
+        pl = probe.textlength(place_line, font=f.small) + int(28 * s)
+        fl = probe.textlength(foot_l, font=f.tiny)
+        fr = probe.textlength(foot_r, font=f.tiny)
+
+        chip_w = 0
+        for key, value in chips:
+            chip_w += int(28 * s) + probe.textlength(value, font=f.label) + int(34 * s)
+        chip_w = max(0, chip_w - int(34 * s))
+
+        row_left = tw + int(26 * s) + iw + int(34 * s) + max(cw, ww)
+        row_a = pl + int(50 * s) + cw            # place line + condition
+        use_strip = bool(cols) and hourly == "strip"
+        rows_h = strip_h if use_strip else spark_h + tick_h
+        body_w = max(pl, row_left, chip_w, fl + int(60 * s) + fr, row_a, strip_w)
+        natural_w = body_w + 2 * inner + int(14 * s)
+        return dict(f=f, inner=inner, win_w=int(natural_w * width_frac),
+                    win_h=inner + int(44 * s) + gap_a + th + gap_b + int(40 * s)
+                          + gap_c + rows_h + int(10 * s) + foot_h + inner,
+                    th=th, iw=iw, tw=tw, cw=cw, ww=ww, spark_h=spark_h,
+                    tick_h=tick_h, foot_h=foot_h, gap_a=gap_a, gap_b=gap_b,
+                    gap_c=gap_c, use_strip=use_strip, strip_h=strip_h,
+                    cell_w=cell_w, hour_h=hour_h, icon_h=icon_h, temp_h=temp_h,
+                    rain_h=rain_h, bar_h=bar_h)
+
+    lay = layout(s)
+    for _ in range(6):  # shrink until it comfortably fits the screen
+        if lay["win_w"] <= w - 2 * mx and lay["win_h"] <= h - 2 * my:
+            break
+        s *= 0.88
+        lay = layout(s)
+    f, inner = lay["f"], lay["inner"]
+    if lay["use_strip"] and cols:
+        # a panel wider than its content needs spreads the hourly cells evenly
+        # rather than leaving dead space on the right
+        lay["cell_w"] = max(lay["cell_w"],
+                            (lay["win_w"] - 2 * inner - int(10 * s)) / len(cols))
+
+    x0 = {"left": mx, "center": (w - lay["win_w"]) // 2,
+          "right": w - mx - lay["win_w"]}.get(cfg.get("anchor_x", "left"), mx)
+    y0 = {"top": my, "center": (h - lay["win_h"]) // 2,
+          "bottom": h - my - lay["win_h"]}.get(cfg.get("anchor_y", "top"), my)
+    x0 = max(0, min(x0, w - lay["win_w"]))          # never hang off the screen
+    y0 = max(0, min(y0, h - lay["win_h"]))
+    x1, y1 = x0 + lay["win_w"], y0 + lay["win_h"]
+    cx = x0 + inner + int(10 * s)
+    rx = x1 - inner
+    rad = int(30 * s)
+    LAST_LAYOUT.clear()
+    LAST_LAYOUT.update(x=x0, y=y0, x1=x1, y1=y1, inner=inner, scale=s,
+                       width=lay["win_w"], height=lay["win_h"])
+
+    # ---------------------------------------------------------------- the HUD
+    # Everything is drawn on one layer so the finished panel can be composited
+    # onto the wallpaper at a single uniform opacity. "RGBA" mode makes fills,
+    # outlines and antialiased text blend into the layer instead of overwriting
+    # its alpha channel.
+    opacity = min(1.0, max(0.05, float(cfg.get("hud_opacity", 1.0))))
+    # Text is drawn on a layer of its own and composited at a higher opacity than the
+    # glass. Damping the letters by the same factor as a half-transparent panel is what
+    # made the smaller runs look muddy; this way the faint text becomes readable while
+    # the big temperature stays the loudest thing in the panel.
+    text_opacity = cfg.get("hud_text_opacity")
+    text_opacity = (min(1.0, opacity + (1.0 - opacity) * 0.7) if text_opacity is None
+                    else min(1.0, max(0.05, float(text_opacity))))
+    hud = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(hud, "RGBA")
+    ink = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    td = ImageDraw.Draw(ink, "RGBA")
+    d.rounded_rectangle([x0, y0, x1, y1], radius=rad, fill=panel_fill)
+    d.rounded_rectangle([x0, y0, x1, y1], radius=rad, outline=hairline,
+                        width=max(1, int(1.5 * s)))
+    d.rounded_rectangle([x0, y0 + int(28 * s), x0 + int(5 * s), y1 - int(28 * s)],
+                        radius=int(2.5 * s), fill=accent + (210,))
+
+    y = y0 + inner
+
+    # row A: where + when, condition
+    td.text((cx + int(24 * s), y + int(2 * s)), ICON["pin"], font=f.icon_s,
+           fill=fg2 + (190,))
+    td.text((cx + int(24 * s) + int(22 * s), y), place_line, font=f.small,
+           fill=fg2 + (240,))
+    td.text((rx, y + int(1 * s)), cond_name, font=f.cond, fill=fg + (255,), anchor="ra")
+    y_a = y                                        # top of the location line
+    y += int(44 * s) + lay["gap_a"]
+
+    # row B: big temperature, condition icon, wind.
+    # The number is centred on the line exactly halfway between the location text
+    # above and the chips below. Centring the digits' own ink box, rather than the
+    # font box, is what makes it look centred: a "8°" has no descender, so a
+    # metrically centred box would still read as sitting too low.
+    y_c = y + lay["th"] + lay["gap_b"]             # top of the chip row
+    a_up, a_down = f.small.getmetrics()
+    c_up, c_down = f.label.getmetrics()
+    mid_y = ((y_a + (a_up + a_down) / 2) + (y_c + (c_up + c_down) / 2)) / 2
+    tbb = f.big.getbbox(temp_str)
+    y_num = mid_y - (tbb[1] + tbb[3]) / 2
+    td.text((cx - int(4 * s), y_num), temp_str, font=f.big, fill=fg + (255,))
+    ix = cx + lay["tw"] + int(26 * s)
+    ibb = f.icon_xl.getbbox(ICON[icon_key])
+    td.text((ix, mid_y - (ibb[1] + ibb[3]) / 2), ICON[icon_key],
+            font=f.icon_xl, fill=accent + (235,))
+    arrow = dir_arrow(int(32 * s), float(cur["wind_direction_10m"]) + 180, fg2 + (215,))
+    ax = rx - lay["ww"] + int(6 * s)
+    hud.alpha_composite(arrow, (int(ax), int(y + lay["th"] - int(34 * s))))
+    td.text((rx, y + lay["th"] - int(30 * s)), wind_txt, font=f.body,
+           fill=fg2 + (245,), anchor="ra")
+    y += lay["th"] + lay["gap_b"]
+
+    # row C: chips
+    x = cx
+    for key, value in chips:
+        td.text((x, y + int(6 * s)), ICON[key], font=f.icon_s, fill=accent + (215,))
+        td.text((x + int(28 * s), y), value, font=f.label, fill=fg + (240,))
+        x += int(28 * s) + d.textlength(value, font=f.label) + int(34 * s)
+    y += int(40 * s) + lay["gap_c"]
+
+    # row D: the next 12 hours
+    if lay["use_strip"]:
+        cell = lay["cell_w"]
+        half = (cell - int(10 * s)) / 2
+        y_icon = y + lay["hour_h"]
+        y_temp = y_icon + lay["icon_h"]
+        y_rain = y_temp + lay["temp_h"]
+        y_bar = y_rain + lay["rain_h"]
+        LAST_LAYOUT.update(strip_y=y, strip_h=lay["strip_h"], cell_w=cell,
+                           hours=len(cols), strip_x=cx)
+        for i, (hlabel, hicon, htemp, ptext, pval, pkind) in enumerate(cols):
+            mid = cx + cell * i + cell / 2
+            td.text((mid, y), hlabel, font=f.tiny, fill=fg2 + (soft_alpha(215),),
+                   anchor="ma")
+            td.text((mid, y_icon), ICON[hicon], font=f.icon_s, fill=accent + (230,),
+                   anchor="ma")
+            td.text((mid, y_temp), htemp, font=f.label, fill=fg + (245,), anchor="ma")
+            td.text((mid, y_rain), ptext, font=f.tiny,
+                   fill=fg2 + (soft_alpha(205 if pval else 105),), anchor="ma")
+            if pval:                     # bar: chance of rain, or millimetres fallen
+                frac = precip_frac(pval, pkind)
+                d.rounded_rectangle([mid - half, y_bar,
+                                     mid - half + (cell - int(10 * s)) * frac,
+                                     y_bar + lay["bar_h"]],
+                                    radius=max(1, lay["bar_h"] // 2),
+                                    fill=accent + (min(235, 80 + int(155 * frac)),))
+        y += lay["strip_h"] + int(10 * s)
+    elif len(temps) >= 3:
+        sparkline(hud, f, (cx + int(6 * s), y), x1 - inner - cx - int(12 * s),
+                  lay["spark_h"], hours, temps, accent + (235,), fg2 + (225,))
+        y += lay["spark_h"] + lay["tick_h"] + int(10 * s)
+
+    td.text((cx, y + int(2 * s)), foot_l, font=f.tiny, fill=fg2 + (soft_alpha(160),))
+    if foot_r:
+        td.text((rx, y + int(2 * s)), foot_r, font=f.tiny,
+               fill=fg2 + (soft_alpha(200),), anchor="ra")
+
+    LAST_LAYOUT.update(opacity=opacity, text_opacity=text_opacity,
+                       row_a_c=y_a + (a_up + a_down) / 2, row_c_c=y_c + (c_up + c_down) / 2,
+                       temp_c=mid_y, temp_ink=(y_num + tbb[1], y_num + tbb[3]))
+
+    # drop shadow first, then the whole HUD scaled to the requested visibility
+    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle([x0 + int(4 * s), y0 + int(10 * s), x1 + int(4 * s),
+                          y1 + int(10 * s)], radius=rad,
+                         fill=(0, 0, 0, int(120 * opacity)))
+    base.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(int(16 * s))))
+
+    if opacity < 1.0:
+        hud.putalpha(hud.split()[3].point(lambda a: int(a * opacity)))
+    base.alpha_composite(hud)
+    if text_opacity < 1.0:
+        ink.putalpha(ink.split()[3].point(lambda a: int(a * text_opacity)))
+    base.alpha_composite(ink)
+
+    return base
+
+
+# -------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--dry-run", action="store_true",
+                    help="render to a preview file, do not touch the desktop")
+    ap.add_argument("--output", help="write the image here instead of the wallpaper dir")
+    ap.add_argument("--place", help="city name to look up, e.g. 'Maribor,SI'")
+    ap.add_argument("--status", action="store_true")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    if args.place:
+        cfg["place"] = args.place
+        cfg["latitude"] = cfg["longitude"] = None
+        cfg["place_name"] = None      # a new place needs a freshly derived label
+
+    if args.status:
+        ssid = active_ssid(cfg)
+        try:                                  # what the last good reading contained
+            cached = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
+        except (OSError, ValueError):
+            cached = {}
+        print(json.dumps({"config": str(CONFIG_FILE),
+                          "wifi_network": ssid,
+                          "wifi_maps_to": cfg.get("networks", {}).get(ssid) if ssid else None,
+                          "providers_tried": cfg.get("providers"),
+                          "last_provider": cached.get("provider"),
+                          "last_reading_time": (cached.get("current") or {}).get("time"),
+                          "config_values": cfg,
+                          "cache": str(CACHE_FILE),
+                          "cache_age_s": (round(time.time() - CACHE_FILE.stat().st_mtime)
+                                          if CACHE_FILE.exists() else None),
+                          "renders": [p.name for p in sorted(DATA_DIR.glob("wx-*.png"))],
+                          "picture_uri": sh(["gsettings", "get", "org.gnome.desktop.background",
+                                             "picture-uri"]).stdout.strip()}, indent=2))
+        return 0
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    dark = dark_mode()
+
+    before = json.dumps(cfg, sort_keys=True)
+    try:
+        lat, lon, label, source = resolve_place(cfg)
+        data = fetch_weather(lat, lon, cfg, label)
+        CACHE_FILE.write_text(json.dumps(data))
+    except Exception as exc:
+        log(f"fetch failed: {exc}")
+        if CACHE_FILE.exists():
+            data = json.loads(CACHE_FILE.read_text())
+            lat, lon = data.get("latitude"), data.get("longitude")
+            label = cfg.get("place_name") or cfg.get("place") or "Home"
+            if isinstance(label, str) and label == "auto":
+                label = "Home"
+            source = "cached reading"
+            data["_cached"] = datetime.fromtimestamp(
+                CACHE_FILE.stat().st_mtime).astimezone().strftime("%H:%M")
+            log("using last good weather instead")
+        else:
+            log("no cached weather either; leaving the desktop alone")
+            return 1
+
+    if json.dumps(cfg, sort_keys=True) != before:
+        save_config(cfg)
+        log(f"remembering {label} at ({lat:.3f}, {lon:.3f})")
+
+    w, h = detect_resolution(cfg)
+    img = render(data, cfg, label, w, h, dark)
+
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    out = Path(args.output) if args.output else DATA_DIR / f"wx-{stamp}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    img.convert("RGB").save(out, "PNG", optimize=True)
+
+    if args.dry_run:
+        log(f"preview written to {out} ({w}x{h}, {'dark' if dark else 'light'})")
+        return 0
+
+    apply_wallpaper(out)
+    prune(cfg["keep_files"])
+    cur = data["current"]
+    provider = data.get("provider", "?")
+    log(f"{label} [{source}] via {provider}: {round(cur['temperature_2m'])}° "
+        f"{WMO.get(int(cur['weather_code']), ('?',))[0]} -> {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

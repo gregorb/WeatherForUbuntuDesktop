@@ -1,0 +1,7 @@
+[Unit]
+Description=Put the current weather on the desktop background
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/wx-wallpaper
+Nice=10

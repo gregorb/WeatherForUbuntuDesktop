@@ -1,0 +1,30 @@
+{
+  "place": "auto",
+  "units": "metric",
+  "base_light": "/usr/share/backgrounds/warty-final-ubuntu.png",
+  "base_dark": "/usr/share/backgrounds/ubuntu-wallpaper-d.png",
+  "resolution": null,
+  "anchor_x": "right",
+  "anchor_y": "bottom",
+  "margin_x_frac": 0.05,
+  "margin_y_frac": 0.2,
+  "panel_scale": 0.5,
+  "hourly": "strip",
+  "hud_opacity": 0.25,
+  "providers": [
+    "arso",
+    "open-meteo"
+  ],
+  "networks": {
+    "Home-5G": "Ljubljana",
+    "Cafe-Guest": {
+      "name": "Bled",
+      "latitude": 46.36,
+      "longitude": 14.11
+    }
+  },
+  "width_frac": 1.2,
+  "keep_files": 5,
+  "timeout": 15,
+  "hud_text_opacity": null
+}
