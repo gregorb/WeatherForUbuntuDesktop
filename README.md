@@ -45,7 +45,7 @@ No API keys, no accounts, no root.
     cd ~/WeatherForUbuntuDesktop
     ./install.sh
 
-That copies `wx-wallpaper` to `~/.local/bin`, copies the three systemd user
+That copies `wx-wallpaper.py` to `~/.local/bin/wx-wallpaper`, copies the three systemd user
 units to `~/.config/systemd/user`, enables the refresh timer and the unlock
 watcher, and renders once so you see something immediately. Your desktop wallpaper is kept as the image the panel is
 drawn onto, so the desktop still looks like your desktop.
@@ -189,7 +189,7 @@ alone rather than blanked.
 
 ## Repository layout
 
-    wx-wallpaper              the whole tool: fetch, translate, render, apply
+    wx-wallpaper.py           the whole tool: fetch, translate, render, apply
     install.sh                copy/symlink the script, install units, start the timer
     uninstall.sh              the reverse, with --purge
     config.example.json       what install.sh copies to ~/.config/wx-wallpaper/config.json

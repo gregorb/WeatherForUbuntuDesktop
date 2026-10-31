@@ -9,7 +9,7 @@ import importlib.util
 import os
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent / "wx-wallpaper"
+REPO = Path(__file__).resolve().parent.parent / "wx-wallpaper.py"
 INSTALLED = Path.home() / ".local/bin/wx-wallpaper"
 
 

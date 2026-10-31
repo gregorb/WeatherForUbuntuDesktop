@@ -41,10 +41,10 @@ mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$UNIT_DIR" "$DATA_DIR"
 
 # ---------------------------------------------------------------- the script
 if [ "$link" -eq 1 ]; then
-    ln -sfn "$HERE/wx-wallpaper" "$BIN_DIR/wx-wallpaper"
-    echo "linked  $BIN_DIR/wx-wallpaper -> $HERE/wx-wallpaper"
+    ln -sfn "$HERE/wx-wallpaper.py" "$BIN_DIR/wx-wallpaper"
+    echo "linked  $BIN_DIR/wx-wallpaper -> $HERE/wx-wallpaper.py"
 else
-    install -m 0755 "$HERE/wx-wallpaper" "$BIN_DIR/wx-wallpaper"
+    install -m 0755 "$HERE/wx-wallpaper.py" "$BIN_DIR/wx-wallpaper"
     echo "installed  $BIN_DIR/wx-wallpaper"
 fi
 
