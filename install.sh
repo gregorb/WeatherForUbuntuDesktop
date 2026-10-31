@@ -62,7 +62,7 @@ for unit in wx-wallpaper.service wx-wallpaper-unlock.service wx-wallpaper.timer;
 done
 systemctl --user daemon-reload
 systemctl --user enable --now wx-wallpaper.timer
-echo "enabled   wx-wallpaper.timer (every 15 minutes)"
+echo "enabled   wx-wallpaper.timer (every 15 minutes, at :06 :21 :36 :51)"
 if systemctl --user enable --now wx-wallpaper-unlock.service 2>/dev/null; then
     echo "enabled   wx-wallpaper-unlock.service (refresh on unlock)"
 else

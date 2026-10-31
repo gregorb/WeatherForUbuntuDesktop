@@ -121,7 +121,9 @@ Slovenia simply falls through to Open-Meteo.
 
 Three units keep the panel current:
 
-* `wx-wallpaper.timer` fires at every quarter hour (`OnCalendar=*:0/15`), 40
+* `wx-wallpaper.timer` fires at six minutes past every quarter hour
+  (`OnCalendar=*:6/15` — :06 :21 :36 :51, so the providers have had time to
+  publish the measurement taken at the rounded quarter), 40
   seconds after you log in, and `Persistent=true` makes a missed run catch up
   when the machine wakes.
 * `wx-wallpaper.service` is the one-shot render the timer runs (`systemctl
@@ -202,7 +204,7 @@ developing so edits here take effect on the next refresh.
 
 ## How a refresh flows
 
-    systemd timer (*/15, +40s after login)   unlock watcher (ActiveChanged=false)
+    systemd timer (*/15 +6min, +40s after login)   unlock watcher (ActiveChanged=false)
         │                                         │
         ▼                                         ▼
     main() ── resolve_place(cfg) ──────────────────────────────────────────────

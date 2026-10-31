@@ -1,9 +1,12 @@
 [Unit]
-Description=Refresh the weather wallpaper every 15 minutes
+Description=Refresh the weather wallpaper every 15 minutes (six minutes past the quarter)
 
 [Timer]
-# quarter past every hour, plus a nudge shortly after you log in
-OnCalendar=*:0/15
+# :06 :21 :36 :51 plus a nudge shortly after you log in. The six-minute offset
+# exists because both providers stamp their readings on the rounded quarter
+# (ARSO on the hour, Open-Meteo on :00/:15/:30/:45) and need a few minutes to
+# publish them; fetching at :00 would just re-fetch the previous measurement.
+OnCalendar=*:6/15
 Persistent=true
 OnStartupSec=40
 RandomizedDelaySec=20
