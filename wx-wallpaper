@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import unicodedata
@@ -75,6 +76,10 @@ DEFAULTS = {
     # provider chain instead of painting hours-old cache on the first failure.
     "fetch_retries": 2,
     "fetch_retry_wait": 15,        # seconds, doubled between attempts
+    # when every provider fails on a DNS lookup the machine is almost surely
+    # still waiting for Wi-Fi after login or unlock, so give the association a
+    # full minute between retries instead of the short backoff
+    "dns_retry_wait": 60,          # seconds between retries after DNS failures
     # Once a cached reading is this old, the "right now" numbers are dropped
     # and hourly cells that have slipped behind the clock go empty.
     "stale_after_min": 60,
@@ -531,7 +536,7 @@ def fetch_weather(lat, lon, cfg, place):
     wanted = cfg.get("providers") or ["arso", "open-meteo"]
     if isinstance(wanted, str):
         wanted = [wanted]
-    errors = []
+    errors = {}
     for name in wanted:
         try:
             if name == "arso":
@@ -541,12 +546,55 @@ def fetch_weather(lat, lon, cfg, place):
             else:
                 raise RuntimeError(f"unknown provider '{name}'")
             if errors:
-                log("fell back to {}: {}".format(name, "; ".join(errors)))
+                log("fell back to {}: {}".format(
+                    name, "; ".join(f"{n}: {e}" for n, e in errors.items())))
             return data
         except Exception as exc:
             log(f"provider {name} failed: {exc}")
-            errors.append(f"{name}: {exc}")
-    raise RuntimeError("no weather provider answered (" + "; ".join(errors) + ")")
+            errors[name] = exc
+    raise WeatherUnavailable(errors)
+
+
+class WeatherUnavailable(RuntimeError):
+    """Every provider failed. .failures maps provider name -> its exception,
+    so callers can tell *why* the whole chain died."""
+
+    def __init__(self, failures):
+        super().__init__("no weather provider answered ("
+                         + "; ".join(f"{n}: {e}" for n, e in failures.items()) + ")")
+        self.failures = failures
+
+
+def _is_dns_error(exc):
+    """Whether this exception (or anything wrapped inside it) is a failed
+    hostname lookup."""
+    seen, stack = set(), [exc]
+    while stack:
+        e = stack.pop()
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, socket.gaierror):     # urlopen wraps it in URLError.reason
+            return True
+        for attr in ("reason", "__cause__", "__context__"):
+            inner = getattr(e, attr, None)
+            if isinstance(inner, BaseException):
+                stack.append(inner)
+        msg = str(e).lower()
+        if ("name or service not known" in msg or "temporary failure in name resolution"
+                in msg or "nodename nor servname" in msg or "getaddrinfo" in msg):
+            return True
+    return False
+
+
+def is_dns_outage(exc):
+    """True when *every* provider failed on a DNS lookup specifically - the
+    signature of a machine whose Wi-Fi has not associated yet right after
+    login or unlock, rather than of a broken provider or a captive portal."""
+    failures = getattr(exc, "failures", None)
+    if failures:
+        return bool(failures) and all(_is_dns_error(e) for e in failures.values())
+    return _is_dns_error(exc)
 
 
 def fetch_weather_retry(lat, lon, cfg, place):
@@ -554,18 +602,27 @@ def fetch_weather_retry(lat, lon, cfg, place):
 
     The run that happens right after login regularly wins the race against DNS
     and loses: one failed attempt used to mean a wallpaper showing last night's
-    weather for the next quarter of an hour. So retry with a growing pause.
+    weather for the next quarter of an hour. A plain failure gets a short,
+    doubling pause; a pure DNS failure gets dns_retry_wait (a minute), because
+    that failure mode means the Wi-Fi association itself is still in progress
+    and no shorter wait will change the outcome.
     """
     tries = max(1, int(cfg.get("fetch_retries", 2)) + 1)
     base = max(0, int(cfg.get("fetch_retry_wait", 15)))
+    dns_wait = max(0, int(cfg.get("dns_retry_wait", 60)))
     for attempt in range(1, tries + 1):
         try:
             return fetch_weather(lat, lon, cfg, place)
-        except Exception:
+        except Exception as exc:
             if attempt >= tries:
                 raise
-            nap = base * (2 ** (attempt - 1))
-            log(f"no provider answered (attempt {attempt}/{tries}); retrying in {nap}s")
+            if is_dns_outage(exc):
+                nap = dns_wait
+                why = "DNS not resolving yet (Wi-Fi still connecting?)"
+            else:
+                nap = base * (2 ** (attempt - 1))
+                why = "no provider answered"
+            log(f"{why} (attempt {attempt}/{tries}); retrying in {nap}s")
             if nap:
                 time.sleep(nap)
 
@@ -1055,9 +1112,29 @@ def render(data, cfg, label, w, h, dark):
                   lay["spark_h"], hours, temps, accent + (235,), fg2 + (225,))
         y += lay["spark_h"] + lay["tick_h"] + int(10 * s)
 
-    td.text((cx, y + int(2 * s)), foot_l, font=f.tiny, fill=fg2 + (soft_alpha(160),))
+    fy = y + int(2 * s)
+    if stale and "stale" in foot_l:
+        # the word "stale" goes on the glass layer in the hairline colour, so it
+        # is exactly as faint as the panel outline; the rest of the footer stays
+        # on the text layer with the ordinary footer brightness
+        pre, post = foot_l.split("stale", 1)
+        td.text((cx, fy), pre, font=f.tiny, fill=fg2 + (soft_alpha(160),))
+        w1 = d.textlength(pre, font=f.tiny)
+        w2 = d.textlength("stale", font=f.tiny)
+        # text drawn straight onto the glass layer is pasted, not blended, so
+        # the hairline colour would punch translucent white holes in the panel;
+        # render the word on its own and alpha-composite it the way dir_arrow
+        # does, and it truly shades over the glass like the outline does
+        word = Image.new("RGBA", (int(w2) + 4, int(34 * s) + 4), (0, 0, 0, 0))
+        ImageDraw.Draw(word).text((0, 0), "stale", font=f.tiny, fill=hairline)
+        hud.alpha_composite(word, (int(cx + w1), int(fy)))
+        td.text((cx + w1 + w2, fy), post, font=f.tiny, fill=fg2 + (soft_alpha(160),))
+        LAST_LAYOUT["footer_stale"] = (cx + w1, cx + w1 + w2, fy)
+    else:
+        td.text((cx, fy), foot_l, font=f.tiny, fill=fg2 + (soft_alpha(160),))
+        LAST_LAYOUT["footer_stale"] = None
     if foot_r:
-        td.text((rx, y + int(2 * s)), foot_r, font=f.tiny,
+        td.text((rx, fy), foot_r, font=f.tiny,
                fill=fg2 + (soft_alpha(200),), anchor="ra")
 
     LAST_LAYOUT.update(opacity=opacity, text_opacity=text_opacity,

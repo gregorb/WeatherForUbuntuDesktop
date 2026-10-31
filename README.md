@@ -87,6 +87,7 @@ force one with `systemctl --user start wx-wallpaper.service`.
 | `keep_files`   | how many renders to retain in `~/.local/share/wx-wallpaper` |
 | `timeout`      | per-request HTTP timeout in seconds |
 | `fetch_retries` / `fetch_retry_wait` | if every provider fails, retry the whole chain this many times, waiting this many seconds first and doubling each time — the point is the first minute after login, when DNS is often not up yet |
+| `dns_retry_wait` | when *every* provider fails on a DNS lookup, wait this many seconds before retrying (no doubling) — that exact failure mode means Wi-Fi has not associated yet, and no shorter wait will change the outcome |
 | `stale_after_min` | once a cached reading is older than this it stops pretending: the current temperature, condition, wind and instant chips disappear (their slots stay, empty, same size), hourly cells the clock passed more than this long ago keep only their hour label, and the footer reads `stale` instead of `cached` |
 | `refresh_on_unlock` / `unlock_min_gap` | used by `wx-wallpaper-unlock.service`: refresh on desktop unlock, but not if the cache is only `unlock_min_gap` seconds old — the timer just drew this same panel |
 
@@ -133,10 +134,15 @@ Three units keep the panel current:
 
 To change the schedule, edit the installed unit and run `systemctl --user daemon-reload`.
 
-**If the network is down** — which is routine in the first minute after login,
-before DNS catches up — the whole provider chain is retried (`fetch_retries`
-attempts with doubling waits) before falling back to the last good reading. That
-reading's footer then says `updated 23:30 · cached · ARSO` — the time of the last
+**If the network is down** — which is routine in the first minute after login
+or unlock, before Wi-Fi has finished associating — the whole provider chain is
+retried (`fetch_retries` attempts) before falling back to the last good
+reading. The pause between attempts is `fetch_retry_wait` with doubling for
+ordinary failures, but a flat `dns_retry_wait` (a minute) when every provider
+died on a hostname lookup specifically — that signature means the Wi-Fi
+association is still in progress, so the script waits for it rather than
+burning its retries on a network that does not exist yet. A cached reading's
+footer then says `updated 23:30 · cached · ARSO` — the time of the last
 successful fetch, not the current clock.
 
 **Once that cached reading is older than `stale_after_min` (an hour), it stops
@@ -277,6 +283,16 @@ size; every spacing below is multiplied by it.
   `variation_name` selection. `ICON["sunrise"]` and `ICON["sunset"]` deliberately
   reuse the sun/moon codepoints, so anything matching glyphs by identity must
   dedupe by codepoint.
+* **Text on the glass layer must go through `alpha_composite`.** `ImageDraw` in
+  `"RGBA"` mode *blends* shapes into the layer but *replaces* pixels for text:
+  drawing low-alpha text straight onto the glass punches translucent holes in
+  the panel instead of shading it. The `stale` marker is rendered to its own
+  image and composited, the way `dir_arrow` already does.
+* **The `stale` marker is hairline ink.** The word is drawn on the glass layer
+  in the hairline colour, so it is exactly as faint as the panel outline while
+  the rest of the footer keeps its text-layer brightness; `LAST_LAYOUT`'s
+  `footer_stale` gives the word's pixel box so tests can compare its contrast
+  against both the outline and the adjacent footer.
 * **Stale data loses its glyphs, not its geometry.** When the cached reading is
   older than `stale_after_min`, the current temperature, condition, wind and
   instant chips draw nothing — but the number slot is still measured with
@@ -337,9 +353,11 @@ What they guard:
   and empty feeds), both precipitation dialects (probability and millimetres),
   the cached-reading footer, the text-vs-glass opacity rule, and that the big
   temperature stays centred between its neighbours without touching either.
-* `check_freshness.py` — the retry ladder of `fetch_weather_retry` (with
-  `fetch_weather` and `time.sleep` stubbed, so backoff waits are observed, not
-  slept), the unlock decision (`unlock_seen` / `unlock_refresh_due` fed captured
+* `check_freshness.py` — the retry ladder of `fetch_weather_retry` in both
+  moods (generic failures double from `fetch_retry_wait`; an all-DNS outage
+  waits `dns_retry_wait` flat), `is_dns_outage` / `WeatherUnavailable`
+  classification (with `fetch_weather` and `time.sleep` stubbed, so backoff
+  waits are observed, not slept), the hairline-faint `stale` marker, the unlock decision (`unlock_seen` / `unlock_refresh_due` fed captured
   `gdbus monitor` lines, plus the config and cache-age gates), and the stale
   panel: empty number slot that keeps its size and fills on a fresh panel,
   instant chips dropped while daily ones survive, exactly the left-behind cells

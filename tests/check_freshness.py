@@ -48,26 +48,41 @@ real_log, real_fetch, real_time_sleep = wx.log, wx.fetch_weather, time.sleep
 wx.log = logs.append
 wx.time.sleep = sleeps.append          # watch the backoff without waiting for it
 try:
-    def make_flaky(succeeds_on):
+    DNS_ERR = "[Errno -2] Name or service not known"
+
+    def make_flaky(succeeds_on, err=DNS_ERR):
         def flaky(*_args):
             calls.append(1)
             if len(calls) < succeeds_on:
-                raise RuntimeError("[Errno -2] Name or service not known")
+                raise RuntimeError(err)
             return {"ok": len(calls)}
         return flaky
 
+    # every provider failing on DNS means Wi-Fi is still associating after
+    # login/unlock: the retry waits a full dns_retry_wait, flat
     wx.fetch_weather = make_flaky(3)
-    out = wx.fetch_weather_retry(0, 0, {"fetch_retries": 2, "fetch_retry_wait": 4}, "x")
+    out = wx.fetch_weather_retry(0, 0, {"fetch_retries": 2, "dns_retry_wait": 60}, "x")
     check("a third attempt still beats the login race", out == {"ok": 3},
           f"({len(calls)} attempts)")
-    check("the waits between attempts double", sleeps == [4, 8], f"({sleeps})")
-    check("the journal mentions the retries",
-          any("retrying" in m for m in logs), f"({logs!r})")
+    check("a pure DNS outage retries a minute later, every time",
+          sleeps == [60, 60], f"({sleeps})")
+    check("the journal names the likely culprit",
+          any("Wi-Fi still connecting" in m for m in logs), f"({logs!r})")
+
+    # other failures (server down, route black-holing) keep the short ladder
+    calls.clear(); sleeps.clear(); logs.clear()
+    wx.fetch_weather = make_flaky(3, err="The read operation timed out")
+    wx.fetch_weather_retry(0, 0, {"fetch_retries": 2, "fetch_retry_wait": 4}, "x")
+    check("non-DNS failures keep the short doubling ladder", sleeps == [4, 8],
+          f"({sleeps})")
+    check("...and the default DNS wait is one minute",
+          "dns_retry_wait" in json.dumps(wx.DEFAULTS)
+          and wx.DEFAULTS["dns_retry_wait"] == 60)
 
     calls.clear(); sleeps.clear()
     wx.fetch_weather = make_flaky(99)
     try:
-        wx.fetch_weather_retry(0, 0, {"fetch_retries": 1, "fetch_retry_wait": 0}, "x")
+        wx.fetch_weather_retry(0, 0, {"fetch_retries": 1, "dns_retry_wait": 0}, "x")
         check("total outage still raises, so main() reaches the cache", False)
     except RuntimeError:
         check("total outage still raises, so main() reaches the cache",
@@ -81,6 +96,48 @@ try:
 finally:
     wx.log, wx.fetch_weather = real_log, real_fetch
     wx.time.sleep = real_time_sleep
+
+# ---- 1b. classifying *why* the whole chain failed
+import socket
+import urllib.error
+
+gai = socket.gaierror(-2, "Name or service not known")
+wrapped = urllib.error.URLError(gai)          # what urlopen actually raises
+both_dns = wx.WeatherUnavailable({"arso": wrapped, "open-meteo": gai})
+mixed = wx.WeatherUnavailable({"arso": wrapped, "open-meteo": RuntimeError("HTTP 500")})
+check("gaierror, its URLError wrapper and bare text all read as DNS",
+      wx.is_dns_outage(gai) and wx.is_dns_outage(wrapped)
+      and wx.is_dns_outage(RuntimeError(f"<urlopen error {DNS_ERR}>")))
+check("every provider on DNS is an outage", bool(wx.is_dns_outage(both_dns)))
+check("one provider answering-with-500 means it is not a DNS outage",
+      not wx.is_dns_outage(mixed))
+check("timeouts are not DNS",
+      not wx.is_dns_outage(RuntimeError("The read operation timed out")))
+check("WeatherUnavailable still reads as a RuntimeError to main()",
+      isinstance(both_dns, RuntimeError)
+      and "arso" in str(both_dns) and "open-meteo" in str(both_dns))
+
+def down_arso(*_a, **_k):
+    raise gai
+
+
+def down_om(*_a, **_k):
+    raise wrapped
+
+
+real_arso, real_om = wx.fetch_arso, wx.fetch_open_meteo
+wx.fetch_arso, wx.fetch_open_meteo = down_arso, down_om
+wx.log = logs.append
+try:
+    try:
+        wx.fetch_weather(0, 0, {}, "x")
+        check("fetch_weather raises WeatherUnavailable with per-provider causes", False)
+    except wx.WeatherUnavailable as exc:
+        check("fetch_weather raises WeatherUnavailable with per-provider causes",
+              set(exc.failures) == {"arso", "open-meteo"} and wx.is_dns_outage(exc))
+finally:
+    wx.log = real_log
+    wx.fetch_arso, wx.fetch_open_meteo = real_arso, real_om
 
 # ---- 2. the unlock decision (watch_unlock reads gdbus monitor lines like these)
 UNLOCK = ("signal sender=:1.63 -> dest=(null destination) serial=245 "
@@ -183,6 +240,30 @@ check("the footer says 'stale', not 'cached'",
       "stale" in foot and "cached" not in foot, f"({foot!r})")
 check("a merely cached footer keeps saying 'cached'",
       "cached" in wx.footer_text({"_cached": "23:30"}, now))
+check("a fresh footer has no stale marker", lay_live["footer_stale"] is None)
+
+
+def band_max(im, x0, x1, y, hgt):
+    return max(sum(im.getpixel((x, yy))[:3])
+               for x in range(int(x0), int(x1)) for yy in range(int(y), int(y) + hgt))
+
+
+# the word "stale" must read as the same faint ink as the panel outline, while
+# the rest of the footer keeps its normal brightness
+sx0, sx1, sy = lay_stale["footer_stale"]
+fh = int(21 * lay_stale["scale"]) + 2
+glass_ref = min(sum(img_stale.getpixel((x, int(sy) - 30))[:3])
+                for x in range(int(sx0) + 2, int(sx1) - 2, 3))
+stale_b = band_max(img_stale, sx0 + 1, sx1, sy, fh)      # +1 dodges pre-segment AA
+prev_b = band_max(img_stale, lay_stale["x"] + lay_stale["inner"], sx0 - 4, sy, fh)
+mid_x = lay_stale["x"] + lay_stale["width"] // 2
+hair_b = band_max(img_stale, mid_x - 30, mid_x + 30, lay_stale["y"] + 1, 2)
+d_stale, d_prev, d_hair = stale_b - glass_ref, prev_b - glass_ref, hair_b - glass_ref
+check("the word 'stale' is still legible ink", d_stale > 15, f"(+{d_stale} over glass)")
+check("the word 'stale' is much dimmer than the footer beside it",
+      d_stale < 0.5 * d_prev, f"(+{d_stale} vs +{d_prev})")
+check("the word 'stale' is as faint as the panel's hairline",
+      0.25 * d_hair <= d_stale <= 2.0 * d_hair, f"(+{d_stale} vs hairline +{d_hair})")
 
 
 def cell_ink(im, lay, i, top_off, height, half):

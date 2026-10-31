@@ -29,6 +29,7 @@
   "hud_text_opacity": null,
   "fetch_retries": 2,
   "fetch_retry_wait": 15,
+  "dns_retry_wait": 60,
   "stale_after_min": 60,
   "refresh_on_unlock": true,
   "unlock_min_gap": 300
