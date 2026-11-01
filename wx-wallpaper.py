@@ -8,6 +8,7 @@ written to a fresh timestamped file. The HUD is composited on top of your normal
 wallpaper, so the desktop still looks like your desktop.
 
     wx-wallpaper            fetch, render, apply
+    wx-wallpaper --cached   paint the last cached reading at once, no network
     wx-wallpaper --dry-run  render to a preview file, leave the desktop alone
     wx-wallpaper --status   show config + last render
 """
@@ -1206,6 +1207,19 @@ def render(data, cfg, label, w, h, dark):
 
 # -------------------------------------------------------------------- main
 
+def load_cached(cfg):
+    """The last good reading, annotated with the moment it was cached and how
+    old it is by now, so the footer can say so rather than pretend."""
+    data = json.loads(CACHE_FILE.read_text())
+    stamp = CACHE_FILE.stat().st_mtime
+    data["_cached"] = datetime.fromtimestamp(stamp).astimezone().strftime("%H:%M")
+    data["_age_min"] = int((time.time() - stamp) / 60)
+    label = cfg.get("place_name") or cfg.get("place") or "Home"
+    if isinstance(label, str) and label == "auto":
+        label = "Home"
+    return data, data.get("latitude"), data.get("longitude"), label
+
+
 def unlock_seen(lines):
     """True when this gdbus monitor text announces that the screen was just
     unlocked; a lock is the same signal carrying true instead of false.
@@ -1243,6 +1257,10 @@ def watch_unlock(cfg):
     means the screen was just unlocked. gdbus comes with the same package as
     gsettings, so this adds no new dependency. Settings are re-read on every
     event, so toggling them needs no restart.
+
+    An unlock runs twice: first --cached, which needs no network and so repaints
+    the desktop the moment you unlock, then the fetch proper, which lands
+    whenever Wi-Fi has finished re-associating.
     """
     if not shutil.which("gdbus"):
         log("gdbus not found; cannot watch for unlocks")
@@ -1272,6 +1290,12 @@ def watch_unlock(cfg):
                 log("unlocked, but the reading is still fresh")
                 continue
             log("desktop unlocked; refreshing")
+            # Paint the cached reading before fetching: the fetch may spend its
+            # whole retry ladder waiting for Wi-Fi to re-associate, and during
+            # that minute the desktop should already say `cached` (or `stale`)
+            # instead of sitting on a render that still claims to be current.
+            if age is not None:
+                subprocess.run([sys.executable, os.path.abspath(__file__), "--cached"])
             subprocess.run([sys.executable, os.path.abspath(__file__)])
     except (BrokenPipeError, KeyboardInterrupt):
         pass
@@ -1284,6 +1308,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dry-run", action="store_true",
                     help="render to a preview file, do not touch the desktop")
+    ap.add_argument("--cached", action="store_true",
+                    help="paint the last cached reading immediately, without fetching")
     ap.add_argument("--output", help="write the image here instead of the wallpaper dir")
     ap.add_argument("--place", help="city name to look up, e.g. 'Maribor,SI'")
     ap.add_argument("--status", action="store_true")
@@ -1333,26 +1359,27 @@ def main():
         log(f"background changed outside wx-wallpaper; drawing on {user_base}")
 
     before = json.dumps(cfg, sort_keys=True)
-    try:
-        lat, lon, label, source = resolve_place(cfg)
-        data = fetch_weather_retry(lat, lon, cfg, label)
-        CACHE_FILE.write_text(json.dumps(data))
-    except Exception as exc:
-        log(f"fetch failed: {exc}")
-        if CACHE_FILE.exists():
-            data = json.loads(CACHE_FILE.read_text())
-            lat, lon = data.get("latitude"), data.get("longitude")
-            label = cfg.get("place_name") or cfg.get("place") or "Home"
-            if isinstance(label, str) and label == "auto":
-                label = "Home"
-            source = "cached reading"
-            stamp = CACHE_FILE.stat().st_mtime
-            data["_cached"] = datetime.fromtimestamp(stamp).astimezone().strftime("%H:%M")
-            data["_age_min"] = int((time.time() - stamp) / 60)
-            log("using last good weather instead")
-        else:
-            log("no cached weather either; leaving the desktop alone")
+    if args.cached:
+        try:
+            data, lat, lon, label = load_cached(cfg)
+        except (OSError, ValueError, TypeError) as exc:
+            log(f"no cached reading to paint ({exc}); leaving the desktop alone")
             return 1
+        source = "cached reading"
+    else:
+        try:
+            lat, lon, label, source = resolve_place(cfg)
+            data = fetch_weather_retry(lat, lon, cfg, label)
+            CACHE_FILE.write_text(json.dumps(data))
+        except Exception as exc:
+            log(f"fetch failed: {exc}")
+            try:
+                data, lat, lon, label = load_cached(cfg)
+                source = "cached reading"
+                log("using last good weather instead")
+            except (OSError, ValueError, TypeError) as exc2:
+                log(f"no cached weather either ({exc2}); leaving the desktop alone")
+                return 1
 
     if json.dumps(cfg, sort_keys=True) != before:
         save_config(cfg)

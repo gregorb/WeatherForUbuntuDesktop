@@ -4,6 +4,7 @@ that is still waking up after login, the unlock-triggered refresh decision, and
 what a panel older than stale_after_min is still allowed to show."""
 import datetime
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -192,6 +193,79 @@ check("unlock_min_gap=0 refreshes on every unlock",
 check("the one-line unlock format carries the same decision",
       wx.unlock_refresh_due(NEW_UNLOCK, base, 600)
       and not wx.unlock_refresh_due(NEW_LOCK, base, None))
+
+
+# ---- 2b. what an unlock actually runs: paint what we have, then fetch
+class FakeMonitor:
+    """Stands in for `gdbus monitor`, feeding watch_unlock a captured stream."""
+
+    def __init__(self, lines):
+        self.stdout = iter(lines)
+
+    def terminate(self):
+        pass
+
+
+def unlock_runs(lines, age_s=None, cfg_extra=None):
+    """The commands watch_unlock invokes for a stream of monitor lines, with a
+    cache this many seconds old (age_s=None: no cache file at all). Settings and
+    the cache path are pointed at scratch space, so the user's own config cannot
+    change the answer."""
+    cache = Path(tempfile.mkdtemp()) / "last-weather.json"
+    if age_s is not None:
+        cache.write_text(json.dumps({"current": {"time": "2026-10-31T22:00"},
+                                     "latitude": 46.1, "longitude": 15.1}))
+        when = time.time() - age_s
+        os.utime(cache, (when, when))
+    ran = []
+    real = (wx.subprocess.Popen, wx.subprocess.run, wx.CACHE_FILE,
+            wx.load_config, wx.log, wx.shutil.which)
+    wx.subprocess.Popen = lambda *_a, **_k: FakeMonitor(lines)
+    wx.subprocess.run = lambda cmd, **_k: ran.append(cmd)
+    wx.CACHE_FILE = cache
+    wx.load_config = lambda: {**wx.DEFAULTS, **(cfg_extra or {})}
+    wx.log = lambda *_a: None
+    wx.shutil.which = lambda name: "/usr/bin/" + name       # no real gdbus needed
+    try:
+        wx.watch_unlock(wx.load_config())
+    finally:
+        (wx.subprocess.Popen, wx.subprocess.run, wx.CACHE_FILE,
+         wx.load_config, wx.log, wx.shutil.which) = real
+    return ["cached" if "--cached" in c else "fetch" for c in ran]
+
+
+check("an unlock paints the cached reading before it starts fetching",
+      unlock_runs([NEW_UNLOCK], 600) == ["cached", "fetch"])
+check("with no cached reading there is nothing to paint, so only the fetch runs",
+      unlock_runs([NEW_UNLOCK], None) == ["fetch"])
+check("an unlock seconds after a timer run runs nothing at all",
+      unlock_runs([NEW_UNLOCK], 60) == [])
+check("a lock runs nothing, however stale the cache",
+      unlock_runs([NEW_LOCK], 600) == [])
+check("refresh_on_unlock=false runs nothing at all",
+      unlock_runs([NEW_UNLOCK], 600, {"refresh_on_unlock": False}) == [])
+
+# ---- 2c. the cached reading carries its own age, which is what makes the
+#          immediate unlock repaint honest rather than a lie about the clock
+cache = Path(tempfile.mkdtemp()) / "last-weather.json"
+cache.write_text(json.dumps({"current": {"time": "2026-10-31T22:00"},
+                             "latitude": 46.1, "longitude": 15.1}))
+when = time.time() - 90 * 60
+os.utime(cache, (when, when))
+real_cache = wx.CACHE_FILE
+wx.CACHE_FILE = cache
+try:
+    cdata, clat, clon, clabel = wx.load_cached({"place_name": "Zagorje"})
+    auto_label = wx.load_cached({"place": "auto"})[3]
+finally:
+    wx.CACHE_FILE = real_cache
+check("the cached reading knows when it was fetched and how old it is by now",
+      cdata["_cached"] == time.strftime("%H:%M", time.localtime(when))
+      and 89 <= cdata["_age_min"] <= 90,
+      f"({cdata['_cached']} and {cdata['_age_min']} min)")
+check("...and keeps the label and coordinates the last fetch resolved",
+      clabel == "Zagorje" and (clat, clon) == (46.1, 15.1), f"({clabel})")
+check("'auto' never becomes a place label", auto_label == "Home", f"({auto_label})")
 
 # ---- 3. what a panel older than stale_after_min may still show
 now = datetime.datetime.now()

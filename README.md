@@ -61,6 +61,11 @@ Try a change without touching the desktop:
 
     wx-wallpaper --dry-run --output /tmp/preview.png
 
+Repaint from the cache alone, with no network at all — this is the first half of
+what the unlock watcher does when you unlock:
+
+    wx-wallpaper --cached
+
 ## Configuration
 
 Everything lives in `~/.config/wx-wallpaper/config.json`. Values are re-read on
@@ -89,7 +94,7 @@ force one with `systemctl --user start wx-wallpaper.service`.
 | `fetch_retries` / `fetch_retry_wait` | if every provider fails, retry the whole chain this many times, waiting this many seconds first and doubling each time — the point is the first minute after login, when DNS is often not up yet |
 | `dns_retry_wait` | when *every* provider fails on a DNS lookup, wait this many seconds before retrying (no doubling) — that exact failure mode means Wi-Fi has not associated yet, and no shorter wait will change the outcome |
 | `stale_after_min` | once a cached reading is older than this it stops pretending: the current temperature, condition, wind and instant chips disappear (their slots stay, empty, same size), hourly cells the clock passed more than this long ago keep only their hour label, and the footer reads `stale` instead of `cached` |
-| `refresh_on_unlock` / `unlock_min_gap` | used by `wx-wallpaper-unlock.service`: refresh on desktop unlock, but not if the cache is only `unlock_min_gap` seconds old — the timer just drew this same panel |
+| `refresh_on_unlock` / `unlock_min_gap` | used by `wx-wallpaper-unlock.service`: on unlock, repaint from the cache at once and then fetch — but do neither if the cache is only `unlock_min_gap` seconds old, the timer just drew this same panel |
 
 Two handy commands:
 
@@ -132,7 +137,9 @@ Three units keep the panel current:
   refreshes the moment you unlock the desktop — it watches `ActiveChanged(false)`
   on `org.gnome.ScreenSaver` via `gdbus`, so no new dependency. Unlocking is the
   first thing you do after logging in, and the timer's 40-second delay may not
-  have fired (or may have raced the network, see below).
+  have fired (or may have raced the network, see below). It runs the script
+  twice: first `--cached`, which needs no network and so repaints the desktop
+  instantly, then the fetch proper, which lands whenever Wi-Fi has re-associated.
 
 To change the schedule, edit the installed unit and run `systemctl --user daemon-reload`.
 
@@ -143,9 +150,12 @@ reading. The pause between attempts is `fetch_retry_wait` with doubling for
 ordinary failures, but a flat `dns_retry_wait` (a minute) when every provider
 died on a hostname lookup specifically — that signature means the Wi-Fi
 association is still in progress, so the script waits for it rather than
-burning its retries on a network that does not exist yet. A cached reading's
-footer then says `updated 23:30 · cached · ARSO` — the time of the last
-successful fetch, not the current clock. The clock in the top line is different:
+burning its retries on a network that does not exist yet. That ladder can take
+a couple of minutes, which is why an unlock paints the cached reading *before*
+it climbs it: the desktop changes the moment you unlock and already admits where
+its numbers come from. A cached reading's footer then says
+`updated 23:30 · cached · ARSO` — the time of the last successful fetch, not the
+current clock. The clock in the top line is different:
 both providers stamp their own measurement time on the reading (ARSO's
 observation `valid` time, Open-Meteo's `current.time`), and that is what the
 panel shows, falling back to the machine clock only if a feed carries neither.
@@ -205,7 +215,9 @@ developing so edits here take effect on the next refresh.
 ## How a refresh flows
 
     systemd timer (*/15 +6min, +40s after login)   unlock watcher (ActiveChanged=false)
-        │                                         │
+        │                                         │  cached reading there? run --cached
+        │                                         │  first: paint it at once, no network,
+        │                                         │  then continue here with the fetch
         ▼                                         ▼
     main() ── resolve_place(cfg) ──────────────────────────────────────────────
         │      networks[SSID] → pinned lat/lon → place geocode → public IP
@@ -364,7 +376,10 @@ What they guard:
   waits `dns_retry_wait` flat), `is_dns_outage` / `WeatherUnavailable`
   classification (with `fetch_weather` and `time.sleep` stubbed, so backoff
   waits are observed, not slept), the hairline-faint `stale` marker, the unlock decision (`unlock_seen` / `unlock_refresh_due` fed captured
-  `gdbus monitor` lines, plus the config and cache-age gates), and the stale
+  `gdbus monitor` lines, plus the config and cache-age gates), what an unlock
+  then runs (with `subprocess` stubbed: the `--cached` paint before the fetch, no
+  paint when there is no cache, nothing at all while the reading is still fresh)
+  and the age markers `load_cached` puts on it, and the stale
   panel: empty number slot that keeps its size and fills on a fresh panel,
   instant chips dropped while daily ones survive, exactly the left-behind cells
   flagged and pixel-empty, and the cached-vs-stale footer wording. Timestamps
