@@ -82,7 +82,7 @@ force one with `systemctl --user start wx-wallpaper.service`.
 | `hourly`       | `strip` (12 hour-by-hour cells), `line` (trend sparkline), `off` |
 | `hud_opacity`  | opacity of the panel glass (`1.0` = solid, `0.25` = barely there) |
 | `hud_text_opacity` | `null` = letters stay clearer than the glass; set a number to damp text exactly as much as the glass |
-| `base_light` / `base_dark` | the wallpaper the panel is drawn onto, per GNOME colour scheme |
+| `base_light` / `base_dark` | the wallpaper the panel is drawn onto, per GNOME colour scheme — only the fallback: pick a new background in GNOME Settings and the next refresh adopts it as the base instead of reverting |
 | `resolution`   | `null` = read from Mutter; or force e.g. `"2560x1440"` |
 | `keep_files`   | how many renders to retain in `~/.local/share/wx-wallpaper` |
 | `timeout`      | per-request HTTP timeout in seconds |

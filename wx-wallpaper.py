@@ -43,7 +43,10 @@ DEFAULTS = {
     "longitude": None,
     "place_name": None,          # label shown on the wallpaper; guessed if null
     "units": "metric",           # "metric" or "imperial"
-    # What the HUD is drawn on top of. Kept as the Ubuntu defaults.
+    # What the HUD is drawn on top of, per colour scheme. Only the fallback:
+    # whenever the desktop shows something that is not one of our own renders,
+    # that image is taken as the new base, so picking a background in GNOME
+    # Settings survives the next weather refresh.
     "base_light": "/usr/share/backgrounds/warty-final-ubuntu.png",
     "base_dark": "/usr/share/backgrounds/ubuntu-wallpaper-d.png",
     "resolution": None,          # null -> detect from Mutter, else "1920x1080"
@@ -656,6 +659,31 @@ def detect_resolution(cfg):
 def dark_mode():
     r = sh(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"])
     return "dark" in r.stdout
+
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+def current_wallpaper(dark):
+    """The image file GNOME is currently showing, or None.
+
+    Anything that is not one of our own renders means the user picked a new
+    background since the last refresh, and becomes the base for the next one.
+    Adaptive wallpapers (an XML file) and non-local URIs are ignored; so is a
+    path that no longer exists, which render() would only turn into a flat fill.
+    """
+    key = "picture-uri-dark" if dark else "picture-uri"
+    raw = sh(["gsettings", "get", "org.gnome.desktop.background", key]).stdout.strip()
+    raw = raw.strip("'\"")
+    if not raw.startswith("file://"):
+        return None
+    path = urllib.parse.unquote(urllib.parse.urlparse(raw).path)
+    p = Path(path)
+    if not path or p.suffix.lower() not in IMAGE_SUFFIXES or not p.is_file():
+        return None
+    if p.parent == DATA_DIR and p.name.startswith("wx-"):
+        return None                      # the panel we painted ourselves
+    return path
 
 
 def apply_wallpaper(path):
@@ -1295,6 +1323,14 @@ def main():
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     dark = dark_mode()
+
+    # Did the user change the background in GNOME since we last painted? If so
+    # the new image, not the one in the config, is what the panel goes on top of.
+    base_key = "base_dark" if dark else "base_light"
+    user_base = current_wallpaper(dark)
+    if user_base and user_base != cfg[base_key]:
+        cfg[base_key] = user_base
+        log(f"background changed outside wx-wallpaper; drawing on {user_base}")
 
     before = json.dumps(cfg, sort_keys=True)
     try:
