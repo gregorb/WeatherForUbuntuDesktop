@@ -1350,6 +1350,8 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     dark = dark_mode()
 
+    before = json.dumps(cfg, sort_keys=True)
+
     # Did the user change the background in GNOME since we last painted? If so
     # the new image, not the one in the config, is what the panel goes on top of.
     base_key = "base_dark" if dark else "base_light"
@@ -1358,7 +1360,6 @@ def main():
         cfg[base_key] = user_base
         log(f"background changed outside wx-wallpaper; drawing on {user_base}")
 
-    before = json.dumps(cfg, sort_keys=True)
     if args.cached:
         try:
             data, lat, lon, label = load_cached(cfg)
